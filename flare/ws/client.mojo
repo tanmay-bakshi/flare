@@ -445,7 +445,9 @@ struct WsClient(Movable):
     # ── Factory ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def connect(url: String) raises -> WsClient:
+    def connect(
+        url: String, extra_headers: List[String] = []
+    ) raises -> WsClient:
         """Connect to a WebSocket server using default TLS configuration.
 
         Equivalent to ``WsClient.connect(url, TlsConfig())``.
@@ -460,10 +462,14 @@ struct WsClient(Movable):
             NetworkError: If the TCP/TLS connection fails.
             WsHandshakeError: If the server's Upgrade response is invalid.
         """
-        return WsClient._connect_impl(url, TlsConfig())
+        return WsClient._connect_impl(url, TlsConfig(), extra_headers)
 
     @staticmethod
-    def connect(url: String, config: TlsConfig) raises -> WsClient:
+    def connect(
+        url: String,
+        config: TlsConfig,
+        extra_headers: List[String] = [],
+    ) raises -> WsClient:
         """Connect to a WebSocket server with custom TLS configuration.
 
         For ``wss://`` URLs, wraps the connection in TLS using ``config``.
@@ -480,10 +486,14 @@ struct WsClient(Movable):
             WsHandshakeError: If the server's Upgrade response is invalid or
                               ``Sec-WebSocket-Accept`` does not match.
         """
-        return WsClient._connect_impl(url, config)
+        return WsClient._connect_impl(url, config, extra_headers)
 
     @staticmethod
-    def _connect_impl(url: String, config: TlsConfig) raises -> WsClient:
+    def _connect_impl(
+        url: String,
+        config: TlsConfig,
+        extra_headers: List[String],
+    ) raises -> WsClient:
         """Internal implementation shared by both ``connect`` overloads.
 
         For ``wss://`` URLs, advertises ALPN ``["http/1.1"]``
@@ -537,8 +547,14 @@ struct WsClient(Movable):
             + key
             + "\r\n"
             + "Sec-WebSocket-Version: 13\r\n"
-            + "\r\n"
         )
+        for i in range(len(extra_headers)):
+            if ("\r" in extra_headers[i]) or ("\n" in extra_headers[i]):
+                raise WsHandshakeError(
+                    "extra header lines must not contain CR or LF"
+                )
+            req += extra_headers[i] + "\r\n"
+        req += "\r\n"
 
         # ── 2. Connect and send ───────────────────────────────────────────────
         var scratch = List[UInt8](capacity=1)

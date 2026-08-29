@@ -64,7 +64,7 @@ def main() raises:
 
 from .frame import WsFrame, WsOpcode, WsCloseCode, WsProtocolError
 from .client import WsClient, WsHandshakeError, WsMessage
-from .server import WsHandler, WsServer, WsConnection
+from .server import WsHandler, WsServer, WsConnection, WsUpgradeRequest
 from .client_h2 import WsOverH2Stream, bootstrap_ws_over_h2
 from .server_h2 import WsOverH2ServerStream, WsH2Handler
 from .auto_client import (

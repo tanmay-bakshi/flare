@@ -470,10 +470,10 @@ def test_ws_server_text_echo_loopback() raises:
     # ── Server: accept + handshake
     var server_stream = srv._listener.accept()
     var srv_peer = server_stream.peer_addr()
-    var key = _read_upgrade_request(server_stream)
-    var accept = _compute_accept_srv(key)
+    var req = _read_upgrade_request(server_stream)
+    var accept = _compute_accept_srv(req.key)
     _send_upgrade_response(server_stream, accept)
-    var conn = WsConnection(server_stream^, srv_peer)
+    var conn = WsConnection(server_stream^, srv_peer, req^)
 
     # ── Client: discard 101, then send masked TEXT frame
     _drain_101(raw_client)
@@ -520,10 +520,10 @@ def test_ws_server_binary_echo_loopback() raises:
 
     var server_stream = srv._listener.accept()
     var srv_peer2 = server_stream.peer_addr()
-    var key = _read_upgrade_request(server_stream)
-    var accept = _compute_accept_srv(key)
+    var req = _read_upgrade_request(server_stream)
+    var accept = _compute_accept_srv(req.key)
     _send_upgrade_response(server_stream, accept)
-    var conn = WsConnection(server_stream^, srv_peer2)
+    var conn = WsConnection(server_stream^, srv_peer2, req^)
 
     _drain_101(raw_client)
 
@@ -568,10 +568,10 @@ def test_ws_server_unmasked_frame_rejected() raises:
 
     var server_stream = srv._listener.accept()
     var srv_peer3 = server_stream.peer_addr()
-    var key = _read_upgrade_request(server_stream)
-    var accept = _compute_accept_srv(key)
+    var req = _read_upgrade_request(server_stream)
+    var accept = _compute_accept_srv(req.key)
     _send_upgrade_response(server_stream, accept)
-    var conn = WsConnection(server_stream^, srv_peer3)
+    var conn = WsConnection(server_stream^, srv_peer3, req^)
 
     _drain_101(raw_client)
 

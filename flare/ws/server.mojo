@@ -159,7 +159,84 @@ def _str_find_srv(s: String, sub: String) -> Int:
     return -1
 
 
-def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> String:
+@fieldwise_init
+struct WsUpgradeRequest(Copyable, Movable):
+    """Parsed client HTTP Upgrade request observed during the handshake.
+
+    Fields:
+        method: HTTP method from the request line (empty when malformed).
+        target: Request-target exactly as the client sent it, path plus
+            optional query string (empty when malformed).
+        key: The ``Sec-WebSocket-Key`` header value.
+        header_names: Every header name in arrival order, lowercased.
+        header_values: Header values parallel to ``header_names``, verbatim.
+    """
+
+    var method: String
+    var target: String
+    var key: String
+    var header_names: List[String]
+    var header_values: List[String]
+
+    def header(self, name: String) -> Optional[String]:
+        """Look up the first value for a header, case-insensitively.
+
+        Args:
+            name: Header name to look up.
+
+        Returns:
+            The first matching header value, or an empty Optional.
+        """
+        var wanted = _lower_srv(name)
+        for i in range(len(self.header_names)):
+            if self.header_names[i] == wanted:
+                return Optional[String](self.header_values[i].copy())
+        return Optional[String]()
+
+    def header_or(self, name: String, default: String) -> String:
+        """Look up the first value for a header, with a fallback.
+
+        Args:
+            name: Header name to look up.
+            default: Value returned when the header is absent.
+
+        Returns:
+            The first matching header value, or ``default``.
+        """
+        var wanted = _lower_srv(name)
+        for i in range(len(self.header_names)):
+            if self.header_names[i] == wanted:
+                return self.header_values[i].copy()
+        return default.copy()
+
+
+def _parse_request_line(line: String) -> Tuple[String, String]:
+    """Split an HTTP request line into method and request-target.
+
+    Lenient by design: malformed request lines yield empty strings so the
+    established missing-header diagnostics stay the only upgrade failures.
+
+    Args:
+        line: The raw request line.
+
+    Returns:
+        ``(method, target)``, either component empty when absent.
+    """
+    var method = String("")
+    var target = String("")
+    var sp1 = _str_find_srv(line, " ")
+    if sp1 > 0:
+        method = String(unsafe_from_utf8=line.as_bytes()[:sp1])
+        var rest = String(unsafe_from_utf8=line.as_bytes()[sp1 + 1 :])
+        var sp2 = _str_find_srv(rest, " ")
+        if sp2 > 0:
+            target = String(unsafe_from_utf8=rest.as_bytes()[:sp2])
+        else:
+            target = rest^
+    return (method^, target^)
+
+
+def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> WsUpgradeRequest:
     """Parse an HTTP WebSocket Upgrade request from a byte buffer.
 
     Identical logic to ``_read_upgrade_request`` but reads from a
@@ -170,7 +247,7 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> String:
         data: Raw HTTP/1.1 Upgrade request bytes.
 
     Returns:
-        The ``Sec-WebSocket-Key`` header value.
+        The parsed ``WsUpgradeRequest``.
 
     Raises:
         NetworkError: If the request is malformed or missing required headers.
@@ -189,10 +266,13 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> String:
             line += chr(Int(c))
         return line^
 
-    # Skip request line
-    _ = read_line(data, pos)
+    var method: String
+    var target: String
+    (method, target) = _parse_request_line(read_line(data, pos))
 
     var ws_key = String("")
+    var header_names = List[String]()
+    var header_values = List[String]()
     var found_upgrade = False
     var found_connection = False
 
@@ -213,6 +293,8 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> String:
                 String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
             ).strip()
         )
+        header_names.append(k.copy())
+        header_values.append(v.copy())
         if k == "sec-websocket-key":
             ws_key = v
         elif k == "upgrade" and _lower_srv(v) == "websocket":
@@ -229,11 +311,17 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> String:
         raise NetworkError(
             "WebSocket upgrade request missing Sec-WebSocket-Key"
         )
-    return ws_key^
+    return WsUpgradeRequest(
+        method=method^,
+        target=target^,
+        key=ws_key^,
+        header_names=header_names^,
+        header_values=header_values^,
+    )
 
 
-def _read_upgrade_request(mut stream: TcpStream) raises -> String:
-    """Read an HTTP upgrade request and return the ``Sec-WebSocket-Key``.
+def _read_upgrade_request(mut stream: TcpStream) raises -> WsUpgradeRequest:
+    """Read an HTTP upgrade request from a stream.
 
     Reads until the blank line terminating HTTP headers.
 
@@ -241,15 +329,18 @@ def _read_upgrade_request(mut stream: TcpStream) raises -> String:
         stream: Accepted TCP stream.
 
     Returns:
-        The ``Sec-WebSocket-Key`` header value.
+        The parsed ``WsUpgradeRequest``.
 
     Raises:
         NetworkError: If the upgrade request is malformed or missing the key.
     """
-    # Skip request line
-    _ = _read_line_srv(stream)
+    var method: String
+    var target: String
+    (method, target) = _parse_request_line(_read_line_srv(stream))
 
     var ws_key = String("")
+    var header_names = List[String]()
+    var header_values = List[String]()
     var found_upgrade = False
     var found_connection = False
 
@@ -270,6 +361,8 @@ def _read_upgrade_request(mut stream: TcpStream) raises -> String:
                 String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
             ).strip()
         )
+        header_names.append(k.copy())
+        header_values.append(v.copy())
         if k == "sec-websocket-key":
             ws_key = v
         elif k == "upgrade" and _lower_srv(v) == "websocket":
@@ -286,7 +379,13 @@ def _read_upgrade_request(mut stream: TcpStream) raises -> String:
         raise NetworkError(
             "WebSocket upgrade request missing Sec-WebSocket-Key"
         )
-    return ws_key^
+    return WsUpgradeRequest(
+        method=method^,
+        target=target^,
+        key=ws_key^,
+        header_names=header_names^,
+        header_values=header_values^,
+    )
 
 
 def _send_upgrade_response(mut stream: TcpStream, accept: String) raises:
@@ -323,6 +422,7 @@ struct WsConnection(Movable):
     Fields:
         _stream: The underlying TCP stream.
         _peer: The remote socket address.
+        _upgrade: The parsed HTTP Upgrade request that opened this connection.
 
     Example:
         ```mojo
@@ -337,10 +437,21 @@ struct WsConnection(Movable):
 
     var _stream: TcpStream
     var _peer: SocketAddr
+    var _upgrade: WsUpgradeRequest
 
-    def __init__(out self, var stream: TcpStream, peer: SocketAddr):
+    def __init__(
+        out self,
+        var stream: TcpStream,
+        peer: SocketAddr,
+        var upgrade: WsUpgradeRequest,
+    ):
         self._stream = stream^
         self._peer = peer
+        self._upgrade = upgrade^
+
+    def upgrade_request(self) -> WsUpgradeRequest:
+        """Return a copy of the parsed HTTP Upgrade request."""
+        return self._upgrade.copy()
 
     def __deinit__(deinit self):
         self._stream.close()
@@ -668,10 +779,10 @@ def _handle_ws_connection(
     Upgrade errors are swallowed so the accept loop continues.
     """
     try:
-        var key = _read_upgrade_request(stream)
-        var accept = _compute_accept_srv(key)
+        var req = _read_upgrade_request(stream)
+        var accept = _compute_accept_srv(req.key)
         _send_upgrade_response(stream, accept)
-        var conn = WsConnection(stream^, peer)
+        var conn = WsConnection(stream^, peer, req^)
         handler(conn)
     except e:
         print("[ws] connection error: " + String(e))

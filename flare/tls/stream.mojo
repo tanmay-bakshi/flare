@@ -731,6 +731,21 @@ struct TlsStream(Movable, Readable):
 
     # ── I/O ───────────────────────────────────────────────────────────────────
 
+    def set_recv_timeout(self, ms: Int) raises:
+        """Bound each subsequent decrypted read by a receive deadline.
+
+        Applies ``SO_RCVTIMEO`` on the underlying TCP socket, so a stalled
+        peer surfaces as ``Timeout`` from :meth:`read` instead of blocking
+        forever.
+
+        Args:
+            ms: Receive timeout in milliseconds.
+
+        Raises:
+            NetworkError: If ``setsockopt(2)`` fails.
+        """
+        self._tcp.set_recv_timeout(ms)
+
     def read(mut self, buf: UnsafePointer[UInt8, _], size: Int) raises -> Int:
         """Decrypt and read up to ``size`` bytes into ``buf``.
 

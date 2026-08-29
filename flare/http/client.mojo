@@ -897,6 +897,7 @@ struct HttpClient(Movable):
         var stream = TlsStream.connect_timeout(
             u.host, u.port, tls_cfg^, self._timeout_ms
         )
+        stream.set_recv_timeout(self._timeout_ms)
         var negotiated = stream.alpn_selected()
         if self._tls_pool.enabled() and negotiated != "h2":
             var key = TlsConnectionPool.build_key(u.scheme, u.host, Int(u.port))
@@ -1010,10 +1011,12 @@ struct HttpClient(Movable):
         if proxy.byte_length() > 0:
             var tcp = self._connect_tunnel(proxy, u.host, u.port)
             stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg^)
+            stream.set_recv_timeout(self._timeout_ms)
         else:
             stream = TlsStream.connect_timeout(
                 u.host, u.port, tls_cfg^, self._timeout_ms
             )
+            stream.set_recv_timeout(self._timeout_ms)
         var negotiated = stream.alpn_selected()
         if negotiated == "h2":
             var resp_h2 = _send_h2_over_tls(
@@ -1151,6 +1154,7 @@ struct HttpClient(Movable):
         B: ChunkSource
     ](self, u: Url, wire: String, mut source: B) raises -> Response:
         var stream = _connect_with_fallback(u.host, u.port, self._timeout_ms)
+        stream.set_recv_timeout(self._timeout_ms)
         var wb = wire.as_bytes()
         stream.write_all(Span[UInt8, _](wb))
         # One chunk in flight at a time -- the body is never materialized.
@@ -1186,6 +1190,7 @@ struct HttpClient(Movable):
         var stream = TlsStream.connect_timeout(
             u.host, u.port, tls_cfg^, self._timeout_ms
         )
+        stream.set_recv_timeout(self._timeout_ms)
         var wb = wire.as_bytes()
         stream.write_all(Span[UInt8, _](wb))
         var cancel = Cancel.never()
@@ -1292,6 +1297,7 @@ struct HttpClient(Movable):
         """
         var pu = Url.parse(proxy_url)
         var tcp = _connect_with_fallback(pu.host, pu.port, self._timeout_ms)
+        tcp.set_recv_timeout(self._timeout_ms)
         var target = host + ":" + String(Int(port))
         var req = String("CONNECT ") + target + " HTTP/1.1\r\n"
         req += "Host: " + target + "\r\n"
@@ -1377,6 +1383,7 @@ struct HttpClient(Movable):
             stream = self._connect_tunnel(proxy, u.host, u.port)
         else:
             stream = _connect_with_fallback(u.host, u.port, self._timeout_ms)
+            stream.set_recv_timeout(self._timeout_ms)
         var wb = wire.as_bytes()
         stream.write_all(Span[UInt8, _](wb))
         return HttpDownload[TcpStream](stream^)
@@ -1440,10 +1447,12 @@ struct HttpClient(Movable):
         if proxy.byte_length() > 0:
             var tcp = self._connect_tunnel(proxy, u.host, u.port)
             stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg^)
+            stream.set_recv_timeout(self._timeout_ms)
         else:
             stream = TlsStream.connect_timeout(
                 u.host, u.port, tls_cfg^, self._timeout_ms
             )
+            stream.set_recv_timeout(self._timeout_ms)
         var wb = wire.as_bytes()
         stream.write_all(Span[UInt8, _](wb))
         return HttpDownload[TlsStream](stream^)
@@ -1983,6 +1992,7 @@ struct HttpClient(Movable):
                 stream = _connect_with_fallback(
                     u.host, u.port, self._timeout_ms
                 )
+                stream.set_recv_timeout(self._timeout_ms)
             if self._prefer_h2c:
                 # h2c via prior knowledge (RFC 9113 §3.4):
                 # send the connection preface immediately and
@@ -2060,6 +2070,7 @@ struct HttpClient(Movable):
             stream = TcpStream(sock^, SocketAddr.localhost(port))
         else:
             stream = _connect_with_fallback(host, port, self._timeout_ms)
+            stream.set_recv_timeout(self._timeout_ms)
 
         var wire_bytes = wire.as_bytes()
         var io_failed = False
@@ -2095,6 +2106,7 @@ struct HttpClient(Movable):
             raise NetworkError("HTTP/1.1 pooled request failed")
 
         var fresh = _connect_with_fallback(host, port, self._timeout_ms)
+        fresh.set_recv_timeout(self._timeout_ms)
         fresh.write_all(Span[UInt8, _](wire_bytes))
         if len(body) > 0:
             fresh.write_all(Span[UInt8, _](body))

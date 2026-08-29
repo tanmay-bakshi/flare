@@ -60,7 +60,7 @@ build:
         -lssl -lcrypto
         -Wl,-rpath,$PREFIX/lib
     # ── json: simdjson FFI wrapper (loaded at runtime by json) ───────────
-    - $CXX -O3 -std=c++17 -fPIC -DNDEBUG -shared
+    - $CXX -O3 -std=c++17 -include iterator -fPIC -DNDEBUG -shared
         -o $PREFIX/lib/libsimdjson_wrapper.so
         json-src/json/cpu/simdjson_ffi/simdjson_wrapper.cpp
         -I$PREFIX/include

@@ -8,13 +8,17 @@ clean close handshake. SIMD-accelerated payload masking for payloads ≥128 byte
 
 ```mojo
 from flare.ws import (
-    WsClient, WsServer,
+    WsClient, WsServer, WsDuplex,
+    WsSender, WsReceiver, WsShutdown,
     WsFrame, WsOpcode, WsCloseCode,
     WsProtocolError, WsHandshakeError,
 )
 ```
 
-- `WsClient` — WebSocket client: `connect`, `send`, `recv`, `close`.
+- `WsClient` — WebSocket client: `connect`, `send_text`, `send_binary`,
+  `recv`, `close`, and the consuming `split` operation.
+- `WsDuplex` — Linear carrier returned by `WsClient.split()` for one sender
+  thread, one receiver thread, and an independent shutdown owner.
 - `WsServer` — WebSocket server: upgrades HTTP connections to WebSocket.
 - `WsFrame` — A single WebSocket frame: `text`, `binary`, `ping`, `pong`, `close`.
 - `WsOpcode` — Opcode byte constants (`TEXT`, `BINARY`, `PING`, `PONG`, `CLOSE`).
@@ -32,7 +36,7 @@ def main() raises:
     var ws = WsClient.connect("ws://echo.websocket.events")
 
     # Send a text frame
-    _ = ws.send(WsFrame.text("hello, flare!"))
+    ws.send_text("hello, flare!")
 
     # Receive echo
     var frame = ws.recv()
@@ -40,7 +44,7 @@ def main() raises:
         print(frame.text_payload()) # hello, flare!
 
     # Ping / pong
-    _ = ws.send(WsFrame.ping())
+    ws.send_frame(WsFrame.ping())
     var pong = ws.recv() # WsOpcode.PONG
 
     # Clean close
@@ -55,15 +59,40 @@ from flare.tls import TlsConfig
 
 def main() raises:
     var ws = WsClient.connect("wss://echo.websocket.events", TlsConfig())
-    _ = ws.send(WsFrame.text("secure hello"))
+    ws.send_text("secure hello")
     var frame = ws.recv()
     print(frame.text_payload())
     ws.close()
 ```
+
+### Full-duplex client
+
+```mojo
+from flare.tls import TlsConfig
+from flare.ws import WsClient
+
+var ws = WsClient.connect("wss://example.com/stream", TlsConfig())
+var duplex = ws^.split()
+var sender = duplex.take_sender()
+var receiver = duplex.take_receiver()
+var shutdown = duplex.take_shutdown()
+
+# Move sender and receiver into their respective application threads. The
+# receiver thread continuously drives recv; shutdown may be retained by the
+# teardown owner to interrupt a blocked receive.
+```
 """
 
 from .frame import WsFrame, WsOpcode, WsCloseCode, WsProtocolError
-from .client import WsClient, WsHandshakeError, WsMessage
+from .client import (
+    WsClient,
+    WsHandshakeError,
+    WsMessage,
+    WsSender,
+    WsReceiver,
+    WsShutdown,
+    WsDuplex,
+)
 from .server import WsHandler, WsServer, WsConnection, WsUpgradeRequest
 from .client_h2 import WsOverH2Stream, bootstrap_ws_over_h2
 from .server_h2 import WsOverH2ServerStream, WsH2Handler

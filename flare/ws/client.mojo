@@ -18,22 +18,23 @@ encoders).
 """
 
 from std.ffi import OwnedDLHandle, c_int
-from .frame import (
-    WsFrame,
-    WsOpcode,
-    WsCloseCode,
-    WsProtocolError,
-    _DecodeResult,
+
+from ._duplex import (
+    WsDuplex,
+    WsReceiver,
+    WsSender,
+    WsShutdown,
+    _split_stream,
 )
+from ._message import WsMessage
+from ._transport import _WsStream
+from .frame import WsFrame, WsOpcode
 from ..crypto.base64 import base64_encode as _base64_encode
 from ..http.url import Url
 from ..tls import TlsStream, TlsConfig
 from ..tcp import TcpStream
 from ..tcp.stream import _connect_with_fallback
-from ..net import SocketAddr, NetworkError, _find_flare_lib
-from ..net.socket import RawSocket, AF_INET, SOCK_STREAM
-from ..net.address import IpAddr
-from ..net._libc import INVALID_FD
+from ..net import NetworkError, _find_flare_lib
 from ..dns import resolve
 from ..utils.dylib import dl_sym
 
@@ -262,153 +263,6 @@ def _lower_local(s: String) -> String:
     return out^
 
 
-# ── Internal stream union for WebSocket I/O ───────────────────────────────────
-# Mojo doesn't have enum variants with payloads, so we use a tagged struct.
-
-
-struct _WsStream(Movable):
-    """Holds either a TLS or plain TCP stream for WebSocket I/O."""
-
-    var _is_tls: Bool
-    var _tls: TlsStream
-    var _tcp: TcpStream
-
-    def __init__(out self, var tls: TlsStream):
-        self._is_tls = True
-        self._tls = tls^
-        self._tcp = _dummy_tcp_stream()
-
-    def __init__(out self, var tcp: TcpStream) raises:
-        self._is_tls = False
-        self._tls = _dummy_tls_stream()
-        self._tcp = tcp^
-
-    def write_all(self, data: Span[UInt8, _]) raises:
-        """Write all bytes to the underlying stream.
-
-        Args:
-            data: Bytes to transmit.
-
-        Raises:
-            NetworkError: On I/O failure.
-        """
-        if self._is_tls:
-            self._tls.write_all(data)
-        else:
-            self._tcp.write_all(data)
-
-    def read(mut self, buf: UnsafePointer[UInt8, _], size: Int) raises -> Int:
-        """Read up to ``size`` bytes from the underlying stream.
-
-        Args:
-            buf: Destination buffer (at least ``size`` bytes of storage).
-            size: Maximum bytes to read.
-
-        Returns:
-            Bytes written to ``buf``, or 0 on clean EOF.
-
-        Raises:
-            NetworkError: On I/O failure.
-        """
-        if self._is_tls:
-            return self._tls.read(buf, size)
-        else:
-            return self._tcp.read(buf, size)
-
-    def close(mut self):
-        """Close the underlying stream."""
-        if self._is_tls:
-            self._tls.close()
-        else:
-            self._tcp.close()
-
-
-def _dummy_tcp_stream() -> TcpStream:
-    """Return a TCP stream with a sentinel fd (INVALID_FD = -1).
-
-    ``RawSocket.close()`` checks ``fd >= 0`` so this never calls ``close(2)``.
-    Used to populate the inactive branch of ``_WsStream``.
-    """
-    var sock = RawSocket(
-        c_int(INVALID_FD), c_int(AF_INET), c_int(SOCK_STREAM), True
-    )
-    return TcpStream(sock^, SocketAddr(IpAddr.localhost(), 0))
-
-
-def _dummy_tls_stream() raises -> TlsStream:
-    """Return a sentinel TLS stream (for use in the inactive branch).
-
-    With ``_ssl=0``, ``TlsStream.__deinit__`` is a no-op.
-    This is never called on an active ``_WsStream`` of TLS type.
-    Raises only if the OpenSSL FFI wrapper cannot be opened (the
-    ``TlsStream`` now caches its lib handle for the connection).
-    """
-    var tcp = _dummy_tcp_stream()
-    return TlsStream(tcp^, 0, 0)
-
-
-struct WsMessage(Movable):
-    """A high-level WebSocket message (Text or Binary).
-
-    Produced by ``WsClient.recv_message()``. Use ``is_text`` to
-    discriminate between message kinds.
-
-    Fields:
-        is_text: ``True`` for a UTF-8 text message; ``False`` for binary.
-
-    Example:
-        ```mojo
-        var msg = ws.recv_message()
-        if msg.is_text:
-            print(msg.as_text())
-        else:
-            print("binary:", len(msg.as_binary()), "bytes")
-        ```
-    """
-
-    var is_text: Bool
-    var _text: String
-    var _binary: List[UInt8]
-
-    def __init__(out self, text: String):
-        """Initialise a text ``WsMessage``.
-
-        Args:
-            text: The UTF-8 text payload.
-        """
-        self.is_text = True
-        self._text = text
-        self._binary = List[UInt8]()
-
-    def __init__(out self, binary: List[UInt8]):
-        """Initialise a binary ``WsMessage``.
-
-        Args:
-            binary: The raw binary payload.
-        """
-        self.is_text = False
-        self._text = ""
-        self._binary = binary.copy()
-
-    def as_text(self) -> String:
-        """Return the message payload as a UTF-8 string.
-
-        Returns:
-            The text payload when ``is_text`` is ``True``; an empty string
-            otherwise.
-        """
-        return self._text
-
-    def as_binary(self) -> List[UInt8]:
-        """Return the message payload as raw bytes.
-
-        Returns:
-            A copy of the binary payload when ``is_text`` is ``False``;
-            an empty list otherwise.
-        """
-        return self._binary.copy()
-
-
 struct WsClient(Movable):
     """A WebSocket client connection established via HTTP Upgrade.
 
@@ -441,6 +295,21 @@ struct WsClient(Movable):
 
     def __deinit__(deinit self):
         self._stream.close()
+
+    def split(deinit self) raises -> WsDuplex:
+        """Split an established connection into two I/O halves and shutdown.
+
+        The receiving application thread is the sole owner of the non-blocking
+        socket/TLS state machine. The sending thread hands complete encoded
+        frames to that loop and waits for publication. ``WsShutdown`` can be
+        retained by teardown code; calling it interrupts the socket and wakes a
+        receiver blocked in ``recv``.
+
+        The receiver must be actively driving ``recv`` or ``recv_message``
+        while sends are in flight. No internal thread is created.
+        """
+        _ = self._key^
+        return _split_stream(self._stream^)
 
     # ── Factory ───────────────────────────────────────────────────────────────
 

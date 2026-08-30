@@ -226,9 +226,48 @@ def _do_ssl_write(
     return Int(f(ssl, Int(data.unsafe_ptr()), c_int(len(data))))
 
 
+def _do_ssl_read_ex(
+    imm lib: OwnedDLHandle,
+    ssl: Int,
+    buf: Pointer[UInt8, _],
+    size: Int,
+) raises -> Int:
+    """Perform one non-blocking ``SSL_read`` step.
+
+    Positive returns are plaintext byte counts. Negative returns use the
+    ``SSL_IO_*`` sentinels below, allowing an owner loop to wait for the
+    requested socket readiness without blocking inside OpenSSL.
+    """
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "flare_ssl_read_ex"
+    )
+    return Int(f(ssl, Int(buf), c_int(size)))
+
+
+def _do_ssl_write_ex(
+    imm lib: OwnedDLHandle, ssl: Int, data: Span[UInt8, _]
+) raises -> Int:
+    """Perform one non-blocking ``SSL_write`` step.
+
+    Positive returns are consumed plaintext byte counts. Negative returns use
+    the ``SSL_IO_*`` sentinels below.
+    """
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "flare_ssl_write_ex"
+    )
+    return Int(f(ssl, Int(data.unsafe_ptr()), c_int(len(data))))
+
+
 def _do_ssl_shutdown(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
     var f = dl_sym[def(Int) thin abi("C") -> c_int](lib, "flare_ssl_shutdown")
     return Int(f(ssl))
+
+
+# Non-blocking I/O sentinels shared with the C wrapper. These are internal
+# transport vocabulary; callers retry after the matching readiness edge.
+comptime _SSL_IO_WANT_READ: Int = -1
+comptime _SSL_IO_WANT_WRITE: Int = -2
+comptime _SSL_IO_CLOSED: Int = -3
 
 
 def _do_ssl_get_version(read lib: OwnedDLHandle, ssl: Int) raises -> String:
@@ -746,6 +785,39 @@ struct TlsStream(Movable, Readable):
         """
         self._tcp.set_recv_timeout(ms)
 
+    def _set_nonblocking(self, enabled: Bool) raises:
+        """Set the owned socket's non-blocking mode for an internal owner loop.
+        """
+        self._tcp._socket.set_nonblocking(enabled)
+
+    def _fd(self) -> c_int:
+        """Return the owned socket fd for internal reactor registration."""
+        return self._tcp._socket.fd
+
+    def _read_nonblocking(
+        mut self, buf: Pointer[UInt8, _], size: Int
+    ) raises -> Int:
+        """Advance one non-blocking TLS read.
+
+        Returns a positive plaintext byte count or an ``_SSL_IO_*`` sentinel.
+        The caller owns readiness waits and must keep the buffer stable across
+        retries.
+        """
+        if size <= 0:
+            return 0
+        return _do_ssl_read_ex(self._lib, self._ssl, buf, size)
+
+    def _write_nonblocking(self, data: Span[UInt8, _]) raises -> Int:
+        """Advance one non-blocking TLS write.
+
+        Returns a positive consumed byte count or an ``_SSL_IO_*`` sentinel.
+        The caller owns readiness waits and must retry a pending write with the
+        same remaining buffer.
+        """
+        if len(data) == 0:
+            return 0
+        return _do_ssl_write_ex(self._lib, self._ssl, data)
+
     def read(mut self, buf: UnsafePointer[UInt8, _], size: Int) raises -> Int:
         """Decrypt and read up to ``size`` bytes into ``buf``.
 
@@ -1060,6 +1132,26 @@ struct TlsStream(Movable, Readable):
             try:
                 _ = _do_ssl_shutdown(self._lib, self._ssl)
                 _do_ssl_free(self._lib, self._ssl)
+                _do_ssl_ctx_free(self._lib, self._ctx)
+            except:
+                pass
+            self._ssl = 0
+            self._ctx = 0
+        self._tcp.close()
+
+    def _close_abortive(mut self):
+        """Free TLS state without attempting ``SSL_shutdown``.
+
+        Internal owner loops use this after a fatal TLS result or an fd-level
+        shutdown. OpenSSL forbids calling ``SSL_shutdown`` after
+        ``SSL_ERROR_SSL`` or ``SSL_ERROR_SYSCALL``.
+        """
+        if self._ssl != 0:
+            try:
+                _do_ssl_free(self._lib, self._ssl)
+            except:
+                pass
+            try:
                 _do_ssl_ctx_free(self._lib, self._ctx)
             except:
                 pass

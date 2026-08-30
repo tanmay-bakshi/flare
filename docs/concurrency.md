@@ -124,6 +124,18 @@ The cross-thread surfaces are an explicit, narrow list:
    submitter polls `Cancel` then joins. This is the only public
    API that crosses pthread boundaries with a user-supplied callable.
 
+4. **Resolver pool** — see
+   [`flare/runtime/resolver_pool.mojo`](../flare/runtime/resolver_pool.mojo).
+   Blocking `getaddrinfo` requests run on a fixed process-wide pool (two
+   workers by default, configurable before first use). Cancellation and an
+   absolute monotonic deadline abandon the request immediately; a late libc
+   result is destroyed without publication. Runtime shutdown joins the pool,
+   while individual connection teardown never does. A wedged libc lookup can
+   occupy one fixed slot until it returns, but the pool bounds that damage and
+   the deadline bounds caller-visible waiting. If operational evidence shows
+   slot wedging matters, the escalation is c-ares, accepting its different
+   system-resolution semantics rather than silently changing them here.
+
 ## The Send-discipline obligation (pthread-bound work)
 
 The pinned Mojo release has no compiler-checked notion of state

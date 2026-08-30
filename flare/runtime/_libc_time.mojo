@@ -46,18 +46,15 @@ comptime _CLOCK_MONOTONIC: Int32 = Int32(
 
 
 @always_inline
-def monotonic_now_ms() -> Int:
-    """Return the monotonic clock in milliseconds.
+def monotonic_now_ns() -> Int64:
+    """Return the monotonic clock in nanoseconds.
 
     Canonical ``flare.runtime`` wrapper over
     ``clock_gettime(CLOCK_MONOTONIC, ...)`` for deadline math in the
-    streaming reactor and elsewhere. The clock is steady (never jumps
-    backwards), so ``monotonic_now_ms() - start`` is a sound elapsed
-    measure. ``CLOCK_MONOTONIC`` is id ``1`` on Linux and ``6`` on
-    macOS (see ``_CLOCK_MONOTONIC``).
+    streaming reactor and elsewhere.
 
     Returns:
-        Milliseconds since an unspecified but fixed epoch.
+        Nanoseconds since an unspecified but fixed epoch.
     """
     var ts = stack_allocation[2, Int64]()
     ts[0] = Int64(0)
@@ -71,7 +68,13 @@ def monotonic_now_ms() -> Int:
         Int32,
         UnsafePointer[Int64, MutUntrackedOrigin],
     ](_CLOCK_MONOTONIC, ts_ext)
-    return Int(ts[0]) * 1000 + Int(ts[1]) // 1_000_000
+    return ts[0] * 1_000_000_000 + ts[1]
+
+
+@always_inline
+def monotonic_now_ms() -> Int:
+    """Return the canonical monotonic clock in milliseconds."""
+    return Int(monotonic_now_ns() // 1_000_000)
 
 
 @always_inline

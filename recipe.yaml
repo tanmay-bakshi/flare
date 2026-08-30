@@ -44,9 +44,10 @@ build:
     - $CXX -O2 -std=c++17 -fPIC -DNDEBUG -shared
         -o $PREFIX/lib/libflare_tls.so
         flare/tls/ffi/openssl_wrapper.cpp
+        flare/runtime/ffi/resolver_pool.cpp
         -I$PREFIX/include
         -L$PREFIX/lib
-        -lssl -lcrypto
+        -lssl -lcrypto -pthread
         -Wl,-rpath,$PREFIX/lib
 
 requirements:

@@ -37,4 +37,10 @@ def main() raises:
 
 from .resolver import resolve, resolve_v4, resolve_v6
 from .cache import DnsCache
-from .async_resolve import resolve_async, order_happy_eyeballs
+from .async_resolve import (
+    ResolveCancellation,
+    ResolveRequest,
+    start_resolve,
+    resolve_async,
+    order_happy_eyeballs,
+)

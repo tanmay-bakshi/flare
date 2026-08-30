@@ -138,8 +138,9 @@ flare.uds      - UnixListener + UnixStream (AF_UNIX sidecar IPC);
                  one UnixStream (encode_frame / decode_frame)
 flare.dns      - getaddrinfo (dual-stack) + an additive TTL
                  ``DnsCache`` over the sync resolver, plus an
-                 off-reactor ``resolve_async`` (getaddrinfo on a pool
-                 thread) and ``order_happy_eyeballs`` address ordering
+                 off-reactor ``resolve_async`` (getaddrinfo on a fixed
+                 process-wide resolver pool) and
+                 ``order_happy_eyeballs`` address ordering
 flare.net      - IpAddr, SocketAddr, RawSocket
 flare.runtime  - Reactor (kqueue / epoll, opt-in io_uring on Linux),
                  TimerWheel, Scheduler, HandoffQueue +

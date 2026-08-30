@@ -40,6 +40,8 @@ TARGET="$BUILD_DIR/libflare_tls.so"
 INSTALLED="$CONDA_PREFIX/lib/libflare_tls.so"
 SOURCE="$SCRIPT_DIR/openssl_wrapper.cpp"
 HEADER="$SCRIPT_DIR/openssl_wrapper.h"
+RESOLVER_SOURCE="$SCRIPT_DIR/../../runtime/ffi/resolver_pool.cpp"
+RESOLVER_HEADER="$SCRIPT_DIR/../../runtime/ffi/resolver_pool.h"
 
 # Verify CONDA_PREFIX is set (pixi sets this on activation)
 if [ -z "$CONDA_PREFIX" ]; then
@@ -53,6 +55,8 @@ _needs_rebuild() {
     [ ! -f "$INSTALLED" ] && return 0
     [ "$SOURCE" -nt "$TARGET" ] && return 0
     [ "$HEADER" -nt "$TARGET" ] && return 0
+    [ "$RESOLVER_SOURCE" -nt "$TARGET" ] && return 0
+    [ "$RESOLVER_HEADER" -nt "$TARGET" ] && return 0
     # Rebuild if the pixi-managed OpenSSL library itself was updated
     [ "$CONDA_PREFIX/lib/libssl.so" -nt "$TARGET" ] 2>/dev/null && return 0
     [ "$CONDA_PREFIX/lib/libssl.dylib" -nt "$TARGET" ] 2>/dev/null && return 0
@@ -100,9 +104,10 @@ echo "Building libflare_tls.so..."
 if $CXX -O2 -std=c++17 -fPIC -DNDEBUG -shared \
     -o "$TARGET" \
     "$SOURCE" \
+    "$RESOLVER_SOURCE" \
     -I"$CONDA_PREFIX/include" \
     -L"$CONDA_PREFIX/lib" \
-    -lssl -lcrypto \
+    -lssl -lcrypto -pthread \
     -Wl,-rpath,"$CONDA_PREFIX/lib"; then
     echo ""
     echo "Build complete!"

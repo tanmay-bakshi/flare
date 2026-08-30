@@ -95,8 +95,8 @@ struct DnsCache(Movable):
         mut self, host: String, cancel: Cancel
     ) raises -> List[IpAddr]:
         """Cache-aware off-reactor resolve: serve a fresh entry from
-        memory (no thread spawn), else resolve on a pool thread via
-        :func:`flare.dns.resolve_async` and cache the result.
+        memory (no request submission), else resolve on the fixed resolver
+        pool via :func:`flare.dns.resolve_async` and cache the result.
 
         Same caching semantics as :meth:`resolve`; only the miss path
         differs (off-thread, cancellable). Failures are not cached."""

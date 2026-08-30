@@ -1,82 +1,178 @@
 """Off-reactor DNS resolution + happy-eyeballs ordering.
 
-``getaddrinfo(3)`` is a blocking syscall with no async variant on the
-platforms flare targets. :func:`resolve_async` offloads it to a fresh
-pool thread (via the same pthread mechanism :func:`block_in_pool` uses)
-so the call runs off the reactor's stack and is bounded by a
-:class:`Cancel` token at the call boundary, rather than running inline.
-The synchronous :func:`flare.dns.resolve` is untouched; callers that do
-not need the off-thread variant pay nothing.
+``getaddrinfo(3)`` is a blocking syscall with no portable cancellation API.
+:func:`start_resolve` submits it to flare's fixed process-wide resolver pool
+and returns independently owned wait and cancellation capabilities. A caller
+can abandon immediately while libc finishes on its pool worker; the eventual
+result is destroyed without publication. :func:`resolve_async` retains the
+older synchronous facade over that machinery.
 
 :func:`order_happy_eyeballs` reorders a resolved address list into the
 RFC 8305 connection-attempt order (interleave IPv6 / IPv4) so a dialer
 can race families without one stalling the other.
 
-The worker thread is joined (the public API is synchronous --
-the submitter waits for the result anyway), so a flipped ``cancel`` is
-honored at the pre-flight and post-flight boundaries, the same contract
-as ``block_in_pool``. A truly fire-and-forget resolve that returns the
-reactor to its loop while the lookup runs would need reactor-side
-completion wiring (eventfd/pipe wakeup) instead.
+The synchronous :func:`flare.dns.resolve` remains the only hostname
+validation, ``getaddrinfo``, and address-conversion truth. The pool is a
+generic callback runner and does not interpret DNS data.
 """
 
-from std.memory import UnsafePointer, alloc
+from std.atomic import Atomic, Ordering
+from std.memory import Pointer, UnsafePointer
+from std.memory.alloc import unsafe_alloc
 
 from ..http.cancel import Cancel
 from ..net import IpAddr
-from ..net.error import AddressParseError, DnsError
-from ..runtime._thread import ThreadHandle, _OpaquePtr
-from ..runtime.blocking import _pool_try_acquire, _pool_release, MAX_POOL_SIZE
-from ..runtime.pool import Pool
+from ..net.error import AddressParseError
+from ..runtime.resolver_pool import (
+    ResolverJob,
+    ResolverWaitStatus,
+    submit_resolver_job,
+)
 from .resolver import resolve
 
 
-@fieldwise_init
 struct _ResolveCtx(Movable):
-    """Cross-thread handoff cell for one :func:`resolve_async` call.
+    """Heap handoff cell owned by one native resolver job."""
 
-    The submitter fills ``host_addr`` (a heap ``String`` cell) and zeroes
-    the rest; the worker writes ``result_addr`` (a heap ``List[IpAddr]``
-    cell) on success or ``err_addr`` (a heap ``String`` cell) on failure,
-    then sets ``ok``. ``pthread_join`` provides the happens-before edge,
-    so plain fields (no atomics) are safe to read after the join."""
+    var host: String
+    var result: List[IpAddr]
+    var error: String
+    var success: Bool
+    var ready: Int64
 
-    var host_addr: Int
-    var result_addr: Int
-    var err_addr: Int
-    var ok: Int
+    def __init__(out self, host: String):
+        self.host = host
+        self.result = List[IpAddr]()
+        self.error = "resolve_async: resolution failed"
+        self.success = False
+        self.ready = 0
 
 
-def _resolve_start(arg: _OpaquePtr) -> _OpaquePtr:
-    """pthread start routine: resolve the host named by ``arg`` (a
-    ``_ResolveCtx*``) and record the outcome in the cell. Must not raise
-    (pthread has no exception channel), so all fallible work is wrapped."""
-    var ctx = arg.unsafe_bitcast[_ResolveCtx]()
-    var host = Pool[String].get_ptr(ctx[].host_addr)[].copy()
-    var res_addr = 0
-    var err_addr = 0
-    var success = False
+@always_inline
+def _store_ready(mut ready: Int64, value: Int64):
+    Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+        Pointer(to=ready).unsafe_bitcast[Scalar[DType.int64]](), value
+    )
+
+
+@always_inline
+def _load_ready(mut ready: Int64) -> Int64:
+    return Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+        Pointer(to=ready).unsafe_bitcast[Scalar[DType.int64]]()
+    )
+
+
+def _resolve_job_run(context: Int):
+    """Run ``resolve`` on a pool worker without crossing an exception."""
+    var ctx = UnsafePointer[_ResolveCtx, MutUntrackedOrigin](
+        unsafe_from_address=context
+    )
     try:
-        var addrs = resolve(host)
-        res_addr = Pool[List[IpAddr]].alloc_move(addrs^)
-        success = True
+        var addrs = resolve(ctx[].host)
+        ctx[].result = addrs^
+        ctx[].success = True
     except e:
-        try:
-            err_addr = Pool[String].alloc_move(String(e))
-        except:
-            err_addr = 0
-    ctx[].result_addr = res_addr
-    ctx[].err_addr = err_addr
-    ctx[].ok = 1 if success else 0
-    return arg
+        ctx[].error = String(e)
+    _store_ready(ctx[].ready, 1)
+
+
+def _resolve_job_cleanup(context: Int):
+    """Destroy a completed or abandoned handoff cell exactly once."""
+    var ctx = UnsafePointer[_ResolveCtx, MutUntrackedOrigin](
+        unsafe_from_address=context
+    )
+    ctx.unsafe_deinit_pointee()
+    ctx.unsafe_free()
+
+
+struct ResolveCancellation(Movable):
+    """Independent cancellation capability for an in-flight resolve."""
+
+    var _job: ResolverJob
+
+    def __init__(out self, var job: ResolverJob):
+        self._job = job^
+
+    def cancel(mut self):
+        """Abandon the request and wake its waiter immediately."""
+        self._job.cancel()
+
+
+struct ResolveRequest(Movable):
+    """Linear waiter for one process-pool resolver request."""
+
+    var _job: ResolverJob
+    var _context: Int
+    var _settled: Bool
+
+    def __init__(out self, var job: ResolverJob, context: Int):
+        self._job = job^
+        self._context = context
+        self._settled = False
+
+    def __deinit__(deinit self):
+        if not self._settled:
+            self._job.cancel()
+
+    def cancellation(self) raises -> ResolveCancellation:
+        """Return another handle that can cancel this request."""
+        return ResolveCancellation(self._job.clone())
+
+    def cancel(mut self):
+        """Abandon this request."""
+        self._job.cancel()
+
+    def wait_until(mut self, deadline_ns: Int64) raises -> List[IpAddr]:
+        """Wait until completion or an absolute monotonic deadline.
+
+        ``deadline_ns == 0`` waits without a deadline. Every terminal result
+        consumes this waiter; a second wait is an API error.
+        """
+        if self._settled:
+            raise Error("resolve request already settled")
+        var status = self._job.wait_until(deadline_ns)
+        self._settled = True
+        if status == ResolverWaitStatus.CANCELLED:
+            raise Error("resolve_async: cancelled mid-flight")
+        if status == ResolverWaitStatus.DEADLINE:
+            raise Error("resolve_async: deadline expired")
+        if status == ResolverWaitStatus.SHUTDOWN:
+            raise Error("resolve_async: resolver runtime shut down")
+        if status != ResolverWaitStatus.COMPLETED:
+            raise Error("resolve_async: resolver job failed")
+
+        var ctx = UnsafePointer[_ResolveCtx, MutUntrackedOrigin](
+            unsafe_from_address=self._context
+        )
+        if _load_ready(ctx[].ready) != 1:
+            raise Error("resolve_async: completed without a published result")
+        if not ctx[].success:
+            raise Error(ctx[].error)
+        return ctx[].result.copy()
+
+
+def start_resolve(host: String) raises -> ResolveRequest:
+    """Submit ``host`` to the process-wide resolver pool."""
+    if host.byte_length() == 0:
+        raise AddressParseError("empty hostname")
+    var context = unsafe_alloc[_ResolveCtx](1)
+    context.unsafe_write(_ResolveCtx(host))
+    var job = submit_resolver_job(
+        _resolve_job_run,
+        _resolve_job_cleanup,
+        Int(context),
+    )
+    return ResolveRequest(job^, Int(context))
 
 
 def resolve_async(host: String, cancel: Cancel) raises -> List[IpAddr]:
     """Resolve ``host`` on a pool thread, off the reactor stack.
 
-    Same result as :func:`flare.dns.resolve` but the ``getaddrinfo``
-    call runs on a fresh kernel thread; a flipped ``cancel`` aborts the
-    call at the pre-flight / post-flight boundary.
+    Same result as :func:`flare.dns.resolve`, with ``getaddrinfo`` running on
+    the fixed process-wide resolver pool. The existing ``Cancel`` vocabulary
+    remains a pre-flight / post-flight boundary; callers needing prompt
+    in-flight cancellation use :func:`start_resolve` and its cancellation
+    handle.
 
     Args:
         host: Hostname or numeric IP string.
@@ -97,52 +193,11 @@ def resolve_async(host: String, cancel: Cancel) raises -> List[IpAddr]:
     if host.byte_length() == 0:
         raise AddressParseError("empty hostname")
 
-    # Admission: share the process-wide pool-thread cap with
-    # ``block_in_pool`` so a fan-out of resolves cannot thread-bomb.
-    if not _pool_try_acquire():
-        raise Error(
-            "resolve_async: pool saturated (MAX_POOL_SIZE="
-            + String(MAX_POOL_SIZE)
-            + " concurrent pool threads)"
-        )
-
-    var host_addr = Pool[String].alloc_move(host)
-    var ctx_ptr = alloc[_ResolveCtx](1)
-    ctx_ptr.unsafe_write(_ResolveCtx(host_addr, 0, 0, 0))
-    var ctx_opaque = UnsafePointer[UInt8, MutUntrackedOrigin](
-        unsafe_from_address=Int(ctx_ptr)
-    )
-
-    try:
-        var handle = ThreadHandle.spawn[_resolve_start](ctx_opaque)
-        handle.join()
-    except e:
-        Pool[String].free(host_addr)
-        ctx_ptr.unsafe_deinit_pointee()
-        ctx_ptr.free()
-        _pool_release()
-        raise e^
-    _pool_release()
-
-    var ok = ctx_ptr[].ok == 1
-    var res_addr = ctx_ptr[].result_addr
-    var err_addr = ctx_ptr[].err_addr
-    Pool[String].free(host_addr)
-    ctx_ptr.unsafe_deinit_pointee()
-    ctx_ptr.free()
-
-    if ok:
-        var out = Pool[List[IpAddr]].get_ptr(res_addr)[].copy()
-        Pool[List[IpAddr]].free(res_addr)
-        if cancel.cancelled():
-            raise Error("resolve_async: cancelled mid-flight")
-        return out^
-
-    var msg = String("resolve_async: resolution failed")
-    if err_addr != 0:
-        msg = Pool[String].get_ptr(err_addr)[].copy()
-        Pool[String].free(err_addr)
-    raise Error(msg)
+    var request = start_resolve(host)
+    var result = request.wait_until(0)
+    if cancel.cancelled():
+        raise Error("resolve_async: cancelled mid-flight")
+    return result^
 
 
 def order_happy_eyeballs(addrs: List[IpAddr]) -> List[IpAddr]:

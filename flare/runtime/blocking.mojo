@@ -35,13 +35,13 @@ Why per-call rather than a singleton pool:
    (DB queries, disk I/O); the overhead is < 5 % of any
    workload that needs ``block_in_pool`` in the first place.
 3. The MAX_POOL_SIZE cap (32) is enforced process-wide via a
-   kernel-backed POSIX named semaphore shared by ``block_in_pool``
-   and ``resolve_async``: a call that would exceed the cap raises
-   "pool saturated" instead of spawning the over-limit thread, so a
-   fan-out burst cannot thread-bomb the process. The mechanism is
-   fail-open (an unsupported platform skips the cap rather than
-   blocking work) and per-process (keyed by pid, since Mojo has no
-   module-level mutable globals).
+   kernel-backed POSIX named semaphore: a call that would exceed the
+   cap raises "pool saturated" instead of spawning the over-limit
+   thread, so a fan-out burst cannot thread-bomb the process. The
+   mechanism is fail-open (an unsupported platform skips the cap
+   rather than blocking work) and per-process (keyed by pid, since
+   Mojo has no module-level mutable globals). DNS resolution uses its
+   own fixed process-wide resolver pool instead.
 
 What the kernel-thread split actually buys:
 
@@ -113,13 +113,12 @@ from ..http.cancel import Cancel, CancelReason
 from ._thread import ThreadHandle
 
 
-# Process-wide cap on concurrent pool threads. Enforced by
-# ``block_in_pool`` and ``resolve_async`` via a kernel-backed POSIX
-# named semaphore (see ``_pool_try_acquire`` / ``_pool_release``): a
-# call that would exceed the cap raises "pool saturated" instead of
-# spawning the over-limit thread, so a pathological fan-out cannot
-# thread-bomb the process. The cap is shared across both entry points
-# (they draw from the same pool).
+# Process-wide cap on concurrent ``block_in_pool`` threads, enforced via a
+# kernel-backed POSIX named semaphore (see ``_pool_try_acquire`` /
+# ``_pool_release``). A call that would exceed the cap raises "pool
+# saturated" instead of spawning the over-limit thread, so a pathological
+# fan-out cannot thread-bomb the process. DNS resolution has a separate fixed
+# process-wide worker pool.
 comptime MAX_POOL_SIZE: Int = 32
 
 

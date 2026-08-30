@@ -1838,10 +1838,9 @@ not touch the measured hot paths in the default configuration
   long-lived stream and only uses the new additive
   `Http2ClientConnection` accessors (`send_request_open` / `drain_body` /
   `stream_ended` / `response_headers`), so existing unary and h2-driver
-  suites stay green. `resolve_async` offloads `getaddrinfo` to a pool
-  thread (same mechanism as `block_in_pool`); the sync `resolve` /
-  `DnsCache.resolve` hot path is unchanged, and a within-TTL cache hit
-  spawns no thread.
+  suites stay green. `resolve_async` offloads `getaddrinfo` to the fixed
+  process-wide resolver pool; the sync `resolve` / `DnsCache.resolve` hot
+  path is unchanged, and a within-TTL cache hit submits no work.
 - 0-RTT replay hardening adds no steady-state cost. The server
   cross-connection strike set is consulted only on a connection's
   *first* 0-RTT packet (gated by `not early_guard.any_seen`), and 0-RTT

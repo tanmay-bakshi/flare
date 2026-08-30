@@ -45,6 +45,18 @@ from .io_uring import (
     SYS_IO_URING_REGISTER,
 )
 from .blocking import block_in_pool, MAX_POOL_SIZE
-from ._libc_time import libc_usleep, libc_nanosleep_ms, monotonic_now_ms
+from .resolver_pool import (
+    configure_resolver_pool,
+    resolver_pool_worker_count,
+    resolver_pool_started,
+    resolver_monotonic_now_ns,
+    shutdown_resolver_pool,
+)
+from ._libc_time import (
+    libc_usleep,
+    libc_nanosleep_ms,
+    monotonic_now_ms,
+    monotonic_now_ns,
+)
 from .handoff import HandoffPolicy, HandoffQueue, WorkerHandoffPool
 from .date_cache import DateCache

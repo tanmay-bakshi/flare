@@ -11,7 +11,7 @@ from ._message import WsMessage
 from ._transport import _WsStream
 from .frame import WsFrame, WsOpcode, _encode_client_frame
 from ..net import NetworkError
-from ..net._libc import _shutdown, SHUT_RDWR
+from ..net._libc import INVALID_FD, _shutdown, SHUT_RDWR
 from ..runtime.event import Event, INTEREST_READ, INTEREST_WRITE
 from ..runtime.reactor import Reactor
 from ..tls.stream import (
@@ -156,122 +156,149 @@ struct _WsWriteCommand(Movable):
         return wire^
 
 
-struct _WsDuplexState(Movable):
-    """Shared control plane; the receiver exclusively owns stream I/O."""
+def _ignore_resolver_hook(_address: Int):
+    """Default hook used while no resolver request is active."""
+    pass
+
+
+struct _WsControl(Movable):
+    """Connection-wide cancellation authority from dial through duplex I/O.
+
+    The stream remains owned by the thread driving the current connection
+    phase. This control plane publishes only its current fd, never ownership of
+    that fd, so cross-thread shutdown can interrupt I/O without racing a close
+    against descriptor reuse. Owner-side final resource release holds ``sync``
+    while clearing and closing the fd through ``begin_owner_close`` /
+    ``finish_owner_close``; potentially blocking protocol shutdown exchanges
+    run while the fd remains published and the mutex remains available.
+    """
 
     var sync: _DuplexSync
-    var stream: _WsStream
     var reactor: Reactor
     var raw_fd: c_int
     var stopping: UInt8
     var owner_closed: UInt8
     var failure_message: String
-    var next_command_id: Int64
-    var pending_command_id: Int64
-    var pending_wire: List[UInt8]
-    var active_command_id: Int64
-    var completed_command_id: Int64
+    var active_resolver_address: Int
+    var active_resolver_cancel: def(Int) thin -> None
+    var active_resolver_release: def(Int) thin -> None
 
-    def __init__(out self, var stream: _WsStream) raises:
-        stream.prepare_duplex()
-        var raw_fd = stream.fd()
-        var reactor = Reactor()
-        reactor.register(raw_fd, _WS_STREAM_TOKEN, INTEREST_READ)
+    def __init__(out self) raises:
         self.sync = _DuplexSync()
-        self.stream = stream^
-        self.reactor = reactor^
-        self.raw_fd = raw_fd
+        self.reactor = Reactor()
+        self.raw_fd = INVALID_FD
         self.stopping = UInt8(0)
-        self.owner_closed = UInt8(0)
+        self.owner_closed = UInt8(1)
         self.failure_message = ""
-        self.next_command_id = 0
-        self.pending_command_id = 0
-        self.pending_wire = List[UInt8]()
-        self.active_command_id = 0
-        self.completed_command_id = 0
-
-    def send(mut self, var wire: List[UInt8]) raises:
-        """Queue one frame and wait for owner-loop publication."""
-        self.sync.lock()
-        if self.is_stopping():
-            var message = self.failure_message.copy()
-            self.sync.unlock()
-            raise NetworkError(
-                message if message != "" else "WebSocket duplex is stopped"
-            )
-        if (
-            _load_i64(self.pending_command_id) != 0
-            or _load_i64(self.active_command_id) != 0
-        ):
-            self.sync.unlock()
-            raise NetworkError(
-                "WsSender supports exactly one sending thread per connection"
-            )
-        self.next_command_id += 1
-        var command_id = self.next_command_id
-        self.pending_wire = wire^
-        _store_i64(self.pending_command_id, command_id)
-        self.sync.unlock()
-
-        try:
-            self.reactor.wakeup()
-        except:
-            pass
-
-        self.sync.lock()
-        while (
-            self.load_completed_command_id() < command_id
-            and not self.is_stopping()
-        ):
-            self.sync.wait()
-        if self.load_completed_command_id() >= command_id:
-            self.sync.unlock()
-            return
-        var message = self.failure_message.copy()
-        self.sync.unlock()
-        raise NetworkError(
-            message if message != "" else "WebSocket send interrupted"
-        )
-
-    def take_pending(mut self) -> Optional[_WsWriteCommand]:
-        """Move one queued command into the owner loop."""
-        self.sync.lock()
-        var command_id = _load_i64(self.pending_command_id)
-        if command_id == 0:
-            self.sync.unlock()
-            return Optional[_WsWriteCommand]()
-        var wire = self.pending_wire^
-        self.pending_wire = List[UInt8]()
-        var command = _WsWriteCommand(command_id, wire^)
-        _store_i64(self.active_command_id, command_id)
-        _store_i64(self.pending_command_id, 0)
-        self.sync.unlock()
-        return Optional[_WsWriteCommand](command^)
-
-    def complete(mut self, command_id: Int64):
-        """Acknowledge a command after every frame byte reaches the fd."""
-        self.sync.lock()
-        if _load_i64(self.active_command_id) == command_id:
-            _store_i64(self.active_command_id, 0)
-            _store_i64(self.completed_command_id, command_id)
-            self.sync.broadcast()
-        self.sync.unlock()
+        self.active_resolver_address = 0
+        self.active_resolver_cancel = _ignore_resolver_hook
+        self.active_resolver_release = _ignore_resolver_hook
 
     def is_stopping(mut self) -> Bool:
         return _load_u8(self.stopping) != UInt8(0)
 
-    def load_completed_command_id(mut self) -> Int64:
-        return _load_i64(self.completed_command_id)
+    def attach_fd(mut self, fd: c_int) -> Bool:
+        """Publish an owner-held fd unless cancellation already won."""
+        self.sync.lock()
+        if self.is_stopping():
+            self.sync.unlock()
+            return False
+        if self.raw_fd != INVALID_FD and self.raw_fd != fd:
+            self.sync.unlock()
+            return False
+        self.raw_fd = fd
+        _store_u8(self.owner_closed, UInt8(0))
+        self.sync.unlock()
+        return True
+
+    def begin_owner_close(mut self, expected_fd: c_int) -> Bool:
+        """Clear ``expected_fd`` while retaining the lock for its close.
+
+        A True result leaves ``sync`` locked. The owner must close the fd
+        without raising and then call :meth:`finish_owner_close`. Keeping the
+        lock across those two operations makes a concurrent ``shutdown`` wait
+        until the descriptor is closed, so it can never target a reused fd.
+        """
+        self.sync.lock()
+        if (
+            _load_u8(self.owner_closed) != UInt8(0)
+            or self.raw_fd != expected_fd
+        ):
+            self.sync.unlock()
+            return False
+        self.raw_fd = INVALID_FD
+        _store_u8(self.owner_closed, UInt8(1))
+        return True
+
+    def finish_owner_close(mut self):
+        """Complete a successful :meth:`begin_owner_close` operation."""
+        self.sync.broadcast()
+        self.sync.unlock()
+
+    def install_resolver_request(
+        mut self,
+        address: Int,
+        cancel: def(Int) thin -> None,
+        release: def(Int) thin -> None,
+    ) -> Bool:
+        """Publish the one resolver request cancellation may abandon."""
+        self.sync.lock()
+        if self.is_stopping():
+            cancel(address)
+            release(address)
+            self.sync.unlock()
+            return False
+        if self.active_resolver_address != 0:
+            cancel(address)
+            release(address)
+            self.sync.unlock()
+            return False
+        self.active_resolver_address = address
+        self.active_resolver_cancel = cancel
+        self.active_resolver_release = release
+        self.sync.unlock()
+        return True
+
+    def clear_resolver_request(mut self, expected_address: Int):
+        """Remove the active resolver hook when its owner regains control."""
+        self.sync.lock()
+        if self.active_resolver_address == expected_address:
+            self.active_resolver_release(expected_address)
+            self.active_resolver_address = 0
+            self.active_resolver_cancel = _ignore_resolver_hook
+            self.active_resolver_release = _ignore_resolver_hook
+        self.sync.unlock()
+
+    def claim_publication(mut self) -> Bool:
+        """Linearize successful connection publication against shutdown."""
+        self.sync.lock()
+        var publish = not self.is_stopping()
+        self.sync.unlock()
+        return publish
+
+    def stopped_message(mut self) -> String:
+        """Return the first terminal message under the control lock."""
+        self.sync.lock()
+        var message = self.failure_message.copy()
+        self.sync.unlock()
+        return message^
 
     def stop(mut self, message: String):
-        """Fix terminal state, interrupt the fd, and wake all waiters."""
+        """Fix terminal state and interrupt whichever connect phase is live."""
         self.sync.lock()
         if not self.is_stopping():
             self.failure_message = message
-            self.pending_wire.clear()
-            _store_i64(self.pending_command_id, 0)
             _store_u8(self.stopping, UInt8(1))
-            if _load_u8(self.owner_closed) == UInt8(0):
+            if self.active_resolver_address != 0:
+                self.active_resolver_cancel(self.active_resolver_address)
+                self.active_resolver_release(self.active_resolver_address)
+            self.active_resolver_address = 0
+            self.active_resolver_cancel = _ignore_resolver_hook
+            self.active_resolver_release = _ignore_resolver_hook
+            if (
+                _load_u8(self.owner_closed) == UInt8(0)
+                and self.raw_fd != INVALID_FD
+            ):
                 _ = _shutdown(self.raw_fd, SHUT_RDWR)
         self.sync.broadcast()
         self.sync.unlock()
@@ -280,14 +307,142 @@ struct _WsDuplexState(Movable):
         except:
             pass
 
+
+struct _WsDuplexState(Movable):
+    """Duplex command state; the receiver exclusively owns stream I/O."""
+
+    var control: ArcPointer[_WsControl]
+    var stream: _WsStream
+    var next_command_id: Int64
+    var pending_command_id: Int64
+    var pending_wire: List[UInt8]
+    var active_command_id: Int64
+    var completed_command_id: Int64
+
+    def __init__(
+        out self,
+        var stream: _WsStream,
+        control: ArcPointer[_WsControl],
+    ) raises:
+        var raw_fd = stream.fd()
+        if not control[].attach_fd(raw_fd):
+            if control[].begin_owner_close(raw_fd):
+                stream.close_abortive()
+                control[].finish_owner_close()
+            else:
+                stream.close_abortive()
+            raise NetworkError("WebSocket duplex stopped before publication")
+        try:
+            stream.prepare_duplex()
+        except error:
+            if control[].begin_owner_close(raw_fd):
+                stream.close_abortive()
+                control[].finish_owner_close()
+            raise error^
+        try:
+            control[].reactor.register(raw_fd, _WS_STREAM_TOKEN, INTEREST_READ)
+        except error:
+            if control[].begin_owner_close(raw_fd):
+                stream.close_abortive()
+                control[].finish_owner_close()
+            raise error^
+        self.control = control
+        self.stream = stream^
+        self.next_command_id = 0
+        self.pending_command_id = 0
+        self.pending_wire = List[UInt8]()
+        self.active_command_id = 0
+        self.completed_command_id = 0
+
+    def send(mut self, var wire: List[UInt8]) raises:
+        """Queue one frame and wait for owner-loop publication."""
+        self.control[].sync.lock()
+        if self.is_stopping():
+            var message = self.control[].failure_message.copy()
+            self.control[].sync.unlock()
+            raise NetworkError(
+                message if message != "" else "WebSocket duplex is stopped"
+            )
+        if (
+            _load_i64(self.pending_command_id) != 0
+            or _load_i64(self.active_command_id) != 0
+        ):
+            self.control[].sync.unlock()
+            raise NetworkError(
+                "WsSender supports exactly one sending thread per connection"
+            )
+        self.next_command_id += 1
+        var command_id = self.next_command_id
+        self.pending_wire = wire^
+        _store_i64(self.pending_command_id, command_id)
+        self.control[].sync.unlock()
+
+        try:
+            self.control[].reactor.wakeup()
+        except:
+            pass
+
+        self.control[].sync.lock()
+        while (
+            self.load_completed_command_id() < command_id
+            and not self.is_stopping()
+        ):
+            self.control[].sync.wait()
+        if self.load_completed_command_id() >= command_id:
+            self.control[].sync.unlock()
+            return
+        var message = self.control[].failure_message.copy()
+        self.control[].sync.unlock()
+        raise NetworkError(
+            message if message != "" else "WebSocket send interrupted"
+        )
+
+    def take_pending(mut self) -> Optional[_WsWriteCommand]:
+        """Move one queued command into the owner loop."""
+        self.control[].sync.lock()
+        var command_id = _load_i64(self.pending_command_id)
+        if command_id == 0:
+            self.control[].sync.unlock()
+            return Optional[_WsWriteCommand]()
+        var wire = self.pending_wire^
+        self.pending_wire = List[UInt8]()
+        var command = _WsWriteCommand(command_id, wire^)
+        _store_i64(self.active_command_id, command_id)
+        _store_i64(self.pending_command_id, 0)
+        self.control[].sync.unlock()
+        return Optional[_WsWriteCommand](command^)
+
+    def complete(mut self, command_id: Int64):
+        """Acknowledge a command after every frame byte reaches the fd."""
+        self.control[].sync.lock()
+        if _load_i64(self.active_command_id) == command_id:
+            _store_i64(self.active_command_id, 0)
+            _store_i64(self.completed_command_id, command_id)
+            self.control[].sync.broadcast()
+        self.control[].sync.unlock()
+
+    def is_stopping(mut self) -> Bool:
+        return self.control[].is_stopping()
+
+    def load_completed_command_id(mut self) -> Int64:
+        return _load_i64(self.completed_command_id)
+
+    def stop(mut self, message: String):
+        """Fix terminal state, interrupt the fd, and wake all waiters."""
+        self.control[].stop(message)
+        self.control[].sync.lock()
+        if self.is_stopping():
+            self.pending_wire.clear()
+            _store_i64(self.pending_command_id, 0)
+        self.control[].sync.broadcast()
+        self.control[].sync.unlock()
+
     def close_from_owner(mut self):
         """Reclaim TLS and socket state on its sole owning thread."""
-        self.sync.lock()
-        if _load_u8(self.owner_closed) == UInt8(0):
-            _store_u8(self.owner_closed, UInt8(1))
+        var raw_fd = self.stream.fd()
+        if self.control[].begin_owner_close(raw_fd):
             self.stream.close_abortive()
-        self.sync.broadcast()
-        self.sync.unlock()
+            self.control[].finish_owner_close()
 
 
 struct WsSender(Movable):
@@ -318,16 +473,16 @@ struct WsSender(Movable):
 
 
 struct WsShutdown(Movable):
-    """Independent, idempotent shutdown handle for a split connection."""
+    """Independent shutdown handle spanning connect and duplex I/O."""
 
-    var _shared: ArcPointer[_WsDuplexState]
+    var _control: ArcPointer[_WsControl]
 
-    def __init__(out self, shared: ArcPointer[_WsDuplexState]):
-        self._shared = shared
+    def __init__(out self, control: ArcPointer[_WsControl]):
+        self._control = control
 
     def shutdown(mut self):
         """Interrupt the socket and wake a receiver blocked in its reactor."""
-        self._shared[].stop("WebSocket duplex shut down")
+        self._control[].stop("WebSocket duplex shut down")
 
 
 struct WsReceiver(Movable):
@@ -468,8 +623,10 @@ struct WsReceiver(Movable):
 
     def _poll(mut self, interest: Int) raises:
         try:
-            self._shared[].reactor.modify(self._shared[].raw_fd, interest)
-            _ = self._shared[].reactor.poll(-1, self._events)
+            self._shared[].control[].reactor.modify(
+                self._shared[].control[].raw_fd, interest
+            )
+            _ = self._shared[].control[].reactor.poll(-1, self._events)
         except error:
             self._fail(String(error))
 
@@ -674,10 +831,19 @@ struct WsDuplex(Movable):
         return self._shutdown.take()
 
 
-def _split_stream(var stream: _WsStream) raises -> WsDuplex:
-    """Create public duplex endpoints around one stream-owner state."""
-    var shared = ArcPointer[_WsDuplexState](_WsDuplexState(stream^))
+def _split_stream(
+    var stream: _WsStream,
+    control: ArcPointer[_WsControl],
+) raises -> WsDuplex:
+    """Create duplex endpoints under an existing connection authority."""
+    var shared = ArcPointer[_WsDuplexState](_WsDuplexState(stream^, control))
     var sender = WsSender(shared)
     var receiver = WsReceiver(shared)
-    var shutdown = WsShutdown(shared)
+    var shutdown = WsShutdown(control)
     return WsDuplex(sender^, receiver^, shutdown^)
+
+
+def _split_stream(var stream: _WsStream) raises -> WsDuplex:
+    """Create duplex endpoints for the blocking-connect compatibility path."""
+    var control = ArcPointer[_WsControl](_WsControl())
+    return _split_stream(stream^, control)

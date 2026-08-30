@@ -45,6 +45,18 @@ int  flare_ssl_ctx_load_cert_key(flare_ssl_ctx_t ctx,
 flare_ssl_t flare_ssl_new(flare_ssl_ctx_t ctx, int fd);
 void        flare_ssl_free(flare_ssl_t ssl);
 
+/**
+ * Prepare an SSL session for a reactor-driven client handshake.
+ *
+ * Applies SNI and hostname verification exactly as ``flare_ssl_connect``
+ * does, then selects the client handshake state. The caller advances the
+ * handshake with ``flare_ssl_do_handshake`` after each requested readiness
+ * edge.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int flare_ssl_prepare_connect(flare_ssl_t ssl, const char* server_name);
+
 int flare_ssl_connect(flare_ssl_t ssl, const char* server_name);
 int flare_ssl_shutdown(flare_ssl_t ssl);
 

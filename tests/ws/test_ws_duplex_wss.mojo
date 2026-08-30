@@ -6,6 +6,7 @@ and automatic PONG traffic must remain byte-aligned on the wire.
 """
 
 from std.atomic import Atomic, Ordering
+from std.collections import Optional
 from std.memory import UnsafePointer
 from std.memory.alloc import unsafe_alloc
 from std.testing import assert_equal, assert_true
@@ -30,12 +31,14 @@ from flare.tls._server_ffi import (
 from flare.utils import SIGKILL, exit, fork, kill, usleep, waitpid
 from flare.ws import (
     WsClient,
+    WsConnectAttempt,
     WsFrame,
     WsOpcode,
     WsReceiver,
     WsSender,
     WsShutdown,
 )
+from flare.ws.client import _close_stream_gracefully_owner
 from flare.ws.server import _compute_accept_srv, _parse_ws_upgrade_bytes
 
 
@@ -49,6 +52,9 @@ comptime _SENDER_PENDING: UInt8 = UInt8(0)
 comptime _SENDER_WAITING: UInt8 = UInt8(1)
 comptime _SENDER_SUCCEEDED: UInt8 = UInt8(2)
 comptime _SENDER_FAILED: UInt8 = UInt8(3)
+comptime _CLOSE_PENDING: UInt8 = UInt8(0)
+comptime _CLOSE_STARTED: UInt8 = UInt8(1)
+comptime _CLOSE_FINISHED: UInt8 = UInt8(2)
 comptime _PRESSURE_RECEIVER_PENDING: UInt8 = UInt8(0)
 comptime _PRESSURE_RECEIVER_INBOUND: UInt8 = UInt8(1)
 comptime _PRESSURE_RECEIVER_VALIDATED: UInt8 = UInt8(2)
@@ -102,12 +108,17 @@ struct _TlsWebSocketPeer(Movable):
     var _input: List[UInt8]
 
     def __init__(
-        out self, listener: TcpListener, constrain_buffers: Bool = False
+        out self,
+        listener: TcpListener,
+        constrain_buffers: Bool = False,
+        handshake_delay_us: Int = 0,
     ) raises:
         var stream: TcpStream = listener.accept()
         if constrain_buffers:
             stream._socket.set_send_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
             stream._socket.set_recv_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
+        if handshake_delay_us > 0:
+            usleep(handshake_delay_us)
         var context: ServerCtx = ServerCtx.new(_SERVER_CERTIFICATE, _SERVER_KEY)
         var ssl_address: Int = server_ssl_new_accept(
             context, Int(stream._socket.fd)
@@ -390,6 +401,13 @@ def _run_coalesced_upgrade_server(listener: TcpListener) raises:
     usleep(5_000_000)
 
 
+def _run_graceful_close_stall_server(listener: TcpListener) raises:
+    """Complete Upgrade but withhold the peer's TLS ``close_notify``."""
+    var peer = _TlsWebSocketPeer(listener)
+    peer.accept_upgrade()
+    usleep(5_000_000)
+
+
 def _run_tls_pressure_server(listener: TcpListener) raises:
     var peer = _TlsWebSocketPeer(listener, constrain_buffers=True)
     peer.accept_upgrade()
@@ -459,6 +477,17 @@ def _spawn_coalesced_upgrade_server(listener: TcpListener) -> Int:
     return process_id
 
 
+def _spawn_graceful_close_stall_server(listener: TcpListener) -> Int:
+    var process_id = fork()
+    if process_id == 0:
+        try:
+            _run_graceful_close_stall_server(listener)
+            exit(0)
+        except:
+            exit(1)
+    return process_id
+
+
 def _spawn_tls_pressure_server(listener: TcpListener) -> Int:
     var process_id: Int = fork()
     if process_id == 0:
@@ -503,6 +532,41 @@ def _spawn_plain_pressure_server(listener: TcpListener) -> Int:
     return process_id
 
 
+def _run_upgrade_stall_server(listener: TcpListener) raises:
+    var stream = listener.accept()
+    usleep(5_000_000)
+    stream.close()
+
+
+def _spawn_upgrade_stall_server(listener: TcpListener) -> Int:
+    var process_id = fork()
+    if process_id == 0:
+        try:
+            _run_upgrade_stall_server(listener)
+            exit(0)
+        except:
+            exit(1)
+    return process_id
+
+
+def _run_cumulative_stall_server(listener: TcpListener) raises:
+    var peer = _TlsWebSocketPeer(listener, handshake_delay_us=60_000)
+    var response = peer._read_upgrade_response()
+    usleep(60_000)
+    peer._write_all(response.as_bytes())
+
+
+def _spawn_cumulative_stall_server(listener: TcpListener) -> Int:
+    var process_id = fork()
+    if process_id == 0:
+        try:
+            _run_cumulative_stall_server(listener)
+            exit(0)
+        except:
+            exit(1)
+    return process_id
+
+
 def _stop_server(process_id: Int):
     _ = kill(process_id, SIGKILL)
     waitpid(process_id)
@@ -517,6 +581,52 @@ def _connect(port: UInt16) raises -> WsClient:
 
 def _connect_plain(port: UInt16) raises -> WsClient:
     return WsClient.connect("ws://127.0.0.1:" + String(Int(port)) + "/duplex")
+
+
+struct _ConnectAttemptThreadContext(Movable):
+    """One connect attempt and its cross-thread terminal observation."""
+
+    var attempt: Optional[WsConnectAttempt]
+    var connected: Bool
+    var error_message: String
+
+    def __init__(out self, var attempt: WsConnectAttempt):
+        self.attempt = Optional[WsConnectAttempt](attempt^)
+        self.connected = False
+        self.error_message = ""
+
+
+def _connect_attempt_thread(argument: _OpaquePtr) -> _OpaquePtr:
+    var context = argument.unsafe_bitcast[_ConnectAttemptThreadContext]()
+    try:
+        var attempt = context[].attempt.take()
+        var client = attempt^.connect()
+        context[].connected = True
+        client.close()
+    except error:
+        context[].error_message = String(error)
+    return _null_opaque_pointer()
+
+
+struct _GracefulCloseThreadContext(Movable):
+    """Established client driven through the production close finalizer."""
+
+    var client: WsClient
+    var state_address: Int
+
+    def __init__(out self, var client: WsClient, state_address: Int):
+        self.client = client^
+        self.state_address = state_address
+
+
+def _graceful_close_thread(argument: _OpaquePtr) -> _OpaquePtr:
+    var context = argument.unsafe_bitcast[_GracefulCloseThreadContext]()
+    _store_state(context[].state_address, _CLOSE_STARTED)
+    _close_stream_gracefully_owner(
+        context[].client._control, context[].client._stream
+    )
+    _store_state(context[].state_address, _CLOSE_FINISHED)
+    return _null_opaque_pointer()
 
 
 struct _SenderThreadContext(Movable):
@@ -1184,10 +1294,10 @@ def test_wss_split_survives_simultaneous_multimegabyte_backpressure() raises:
     var port: UInt16 = listener.local_addr().port
     var process_id: Int = _spawn_tls_pressure_server(listener)
     var client: WsClient = _connect(port)
-    client._stream._tls._tcp._socket.set_send_buffer(
+    client._stream._tls.value()._tcp._socket.set_send_buffer(
         _PRESSURE_SOCKET_BUFFER_BYTES
     )
-    client._stream._tls._tcp._socket.set_recv_buffer(
+    client._stream._tls.value()._tcp._socket.set_recv_buffer(
         _PRESSURE_SOCKET_BUFFER_BYTES
     )
     _exercise_pressure_connection(client^, process_id, "tls-pressure-validated")
@@ -1199,10 +1309,237 @@ def test_plain_split_survives_simultaneous_multimegabyte_backpressure() raises:
     var port: UInt16 = listener.local_addr().port
     var process_id: Int = _spawn_plain_pressure_server(listener)
     var client: WsClient = _connect_plain(port)
-    client._stream._tcp._socket.set_send_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
-    client._stream._tcp._socket.set_recv_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
+    client._stream._tcp.value()._socket.set_send_buffer(
+        _PRESSURE_SOCKET_BUFFER_BYTES
+    )
+    client._stream._tcp.value()._socket.set_recv_buffer(
+        _PRESSURE_SOCKET_BUFFER_BYTES
+    )
     _exercise_pressure_connection(
         client^, process_id, "plain-pressure-validated"
+    )
+
+
+def test_connect_attempt_absolute_deadline_covers_upgrade_stall() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var process_id = _spawn_upgrade_stall_server(listener)
+    var started_ms = monotonic_now_ms()
+    var message = String("")
+    try:
+        var attempt = WsClient.connect_attempt(
+            "ws://127.0.0.1:" + String(Int(port)) + "/deadline",
+            handshake_timeout_ms=100,
+        )
+        var client = attempt^.connect()
+        client.close()
+    except error:
+        message = String(error)
+    var elapsed_ms = monotonic_now_ms() - started_ms
+    _stop_server(process_id)
+
+    assert_true("deadline expired" in message, message)
+    assert_true(elapsed_ms >= 50, "deadline fired implausibly early")
+    assert_true(elapsed_ms < 1_000, "deadline did not bound the stall")
+
+
+def test_connect_attempt_requires_positive_explicit_timeout() raises:
+    var message = String("")
+    try:
+        _ = WsClient.connect_attempt(
+            "ws://127.0.0.1:9/invalid-timeout",
+            handshake_timeout_ms=0,
+        )
+    except error:
+        message = String(error)
+    assert_true("must be a positive explicit timeout" in message, message)
+
+
+def test_connect_attempt_shutdown_interrupts_upgrade_stall() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var process_id = _spawn_upgrade_stall_server(listener)
+    var attempt = WsClient.connect_attempt(
+        "ws://127.0.0.1:" + String(Int(port)) + "/cancel",
+        handshake_timeout_ms=5_000,
+    )
+    var shutdown = attempt.take_shutdown()
+    var context = unsafe_alloc[_ConnectAttemptThreadContext](1)
+    context.unsafe_write(_ConnectAttemptThreadContext(attempt^))
+    var argument = _OpaquePtr(unsafe_from_address=Int(context))
+    var thread = ThreadHandle.spawn[_connect_attempt_thread](argument)
+
+    usleep(50_000)
+    var shutdown_ms = monotonic_now_ms()
+    shutdown.shutdown()
+    thread.join()
+    var elapsed_ms = monotonic_now_ms() - shutdown_ms
+    _stop_server(process_id)
+
+    var connected = context[].connected
+    var message = context[].error_message.copy()
+    context.unsafe_deinit_pointee()
+    context.unsafe_free()
+    assert_true(not connected, "cancelled attempt published a client")
+    assert_true("shut down" in message, message)
+    assert_true(elapsed_ms < 1_000, "shutdown did not interrupt the stall")
+
+
+def test_connect_attempt_shutdown_interrupts_tls_handshake_stall() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var process_id = _spawn_upgrade_stall_server(listener)
+    var config = TlsConfig(ca_bundle=_CA_CERTIFICATE)
+    var attempt = WsClient.connect_attempt(
+        "wss://localhost:" + String(Int(port)) + "/cancel",
+        config,
+        handshake_timeout_ms=5_000,
+    )
+    var shutdown = attempt.take_shutdown()
+    var context = unsafe_alloc[_ConnectAttemptThreadContext](1)
+    context.unsafe_write(_ConnectAttemptThreadContext(attempt^))
+    var argument = _OpaquePtr(unsafe_from_address=Int(context))
+    var thread = ThreadHandle.spawn[_connect_attempt_thread](argument)
+
+    usleep(50_000)
+    var shutdown_ms = monotonic_now_ms()
+    shutdown.shutdown()
+    thread.join()
+    var elapsed_ms = monotonic_now_ms() - shutdown_ms
+    _stop_server(process_id)
+
+    var connected = context[].connected
+    var message = context[].error_message.copy()
+    context.unsafe_deinit_pointee()
+    context.unsafe_free()
+    assert_true(not connected, "cancelled TLS attempt published a client")
+    assert_true("shut down" in message, message)
+    assert_true(elapsed_ms < 1_000, "shutdown did not interrupt the TLS stall")
+
+
+def test_connect_attempt_shutdown_before_connect_prevents_publication() raises:
+    var attempt = WsClient.connect_attempt(
+        "ws://127.0.0.1:9/pre-cancel",
+        handshake_timeout_ms=5_000,
+    )
+    var shutdown = attempt.take_shutdown()
+    shutdown.shutdown()
+    var message = String("")
+    var connected = False
+    try:
+        var client = attempt^.connect()
+        connected = True
+        client.close()
+    except error:
+        message = String(error)
+    assert_true(not connected, "pre-cancelled attempt published a client")
+    assert_true("shut down" in message, message)
+
+
+def test_connect_attempt_predial_shutdown_survives_connect_and_split() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var process_id = _spawn_plain_server(listener)
+    var attempt = WsClient.connect_attempt(
+        "ws://127.0.0.1:" + String(Int(port)) + "/continuity",
+        handshake_timeout_ms=2_000,
+    )
+    var predial_shutdown = attempt.take_shutdown()
+    var client = attempt^.connect()
+    client.send_text("continuity-proof")
+    var echo = client.recv()
+    var duplex = client^.split()
+    var sender = duplex.take_sender()
+    var receiver = duplex.take_receiver()
+    var split_shutdown = duplex.take_shutdown()
+
+    predial_shutdown.shutdown()
+    var interrupted = False
+    try:
+        _ = receiver.recv()
+    except:
+        interrupted = True
+    split_shutdown.shutdown()
+    _stop_server(process_id)
+
+    assert_equal(echo.opcode, WsOpcode.TEXT)
+    assert_equal(echo.text_payload(), "continuity-proof")
+    assert_true(interrupted, "pre-dial shutdown lost authority after split")
+
+
+def test_connect_attempt_deadline_is_cumulative_across_tls_and_upgrade() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var process_id = _spawn_cumulative_stall_server(listener)
+    var config = TlsConfig(ca_bundle=_CA_CERTIFICATE)
+    var started_ms = monotonic_now_ms()
+    var message = String("")
+    try:
+        var attempt = WsClient.connect_attempt(
+            "wss://localhost:" + String(Int(port)) + "/cumulative",
+            config,
+            handshake_timeout_ms=100,
+        )
+        var client = attempt^.connect()
+        client.close()
+    except error:
+        message = String(error)
+    var elapsed_ms = monotonic_now_ms() - started_ms
+    _stop_server(process_id)
+
+    assert_true("deadline expired" in message, message)
+    assert_true(elapsed_ms >= 50, "cumulative deadline fired too early")
+    assert_true(elapsed_ms < 1_000, "phase delays reset the deadline")
+
+
+def test_shutdown_interrupts_graceful_tls_close() raises:
+    """Keep cancellation available while TLS waits for peer close_notify."""
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var process_id = _spawn_graceful_close_stall_server(listener)
+    var config = TlsConfig(ca_bundle=_CA_CERTIFICATE)
+    var attempt = WsClient.connect_attempt(
+        "wss://localhost:" + String(Int(port)) + "/close-stall",
+        config,
+        handshake_timeout_ms=2_000,
+    )
+    var shutdown = attempt.take_shutdown()
+    var client = attempt^.connect()
+
+    # Prime OpenSSL's two-call shutdown protocol. The production finalizer's
+    # next call waits for the peer close_notify that this fixture withholds.
+    client.send_frame(WsFrame.close())
+    client._stream.shutdown_graceful()
+
+    var state = unsafe_alloc[UInt8](1)
+    state.unsafe_write(_CLOSE_PENDING)
+    var context = unsafe_alloc[_GracefulCloseThreadContext](1)
+    context.unsafe_write(_GracefulCloseThreadContext(client^, Int(state)))
+    var argument = _OpaquePtr(unsafe_from_address=Int(context))
+    var thread = ThreadHandle.spawn[_graceful_close_thread](argument)
+
+    var deadline = monotonic_now_ms() + 1_000
+    while (
+        _load_state(Int(state)) == _CLOSE_PENDING
+        and monotonic_now_ms() < deadline
+    ):
+        usleep(1_000)
+    usleep(25_000)
+    var shutdown_started_at = monotonic_now_ms()
+    shutdown.shutdown()
+    thread.join()
+    var shutdown_elapsed = monotonic_now_ms() - shutdown_started_at
+    var close_state = _load_state(Int(state))
+    _stop_server(process_id)
+
+    context.unsafe_deinit_pointee()
+    context.unsafe_free()
+    state.unsafe_free()
+
+    assert_equal(close_state, _CLOSE_FINISHED)
+    assert_true(
+        shutdown_elapsed < 1_000,
+        "shutdown could not interrupt graceful TLS close",
     )
 
 
@@ -1214,4 +1551,12 @@ def main() raises:
     test_wss_split_preserves_frame_coalesced_with_upgrade()
     test_wss_split_survives_simultaneous_multimegabyte_backpressure()
     test_plain_split_survives_simultaneous_multimegabyte_backpressure()
+    test_connect_attempt_absolute_deadline_covers_upgrade_stall()
+    test_connect_attempt_requires_positive_explicit_timeout()
+    test_connect_attempt_shutdown_interrupts_upgrade_stall()
+    test_connect_attempt_shutdown_interrupts_tls_handshake_stall()
+    test_connect_attempt_shutdown_before_connect_prevents_publication()
+    test_connect_attempt_predial_shutdown_survives_connect_and_split()
+    test_connect_attempt_deadline_is_cumulative_across_tls_and_upgrade()
+    test_shutdown_interrupts_graceful_tls_close()
     print("test_ws_duplex_wss: OK")

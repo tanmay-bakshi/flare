@@ -1,11 +1,10 @@
 """Internal stream union shared by blocking and duplex WebSocket clients."""
 
+from std.collections import Optional
 from std.ffi import c_int, c_size_t, get_errno, ErrNo
 
-from ..net import SocketAddr, NetworkError
-from ..net._libc import _recv, _send, MSG_NOSIGNAL, INVALID_FD
-from ..net.address import IpAddr
-from ..net.socket import RawSocket, AF_INET, SOCK_STREAM
+from ..net import NetworkError
+from ..net._libc import _recv, _send, MSG_NOSIGNAL
 from ..tcp import TcpStream
 from ..tls import TlsStream
 from ..tls.stream import (
@@ -22,8 +21,8 @@ struct _WsStream(Movable):
     """Hold either a TLS or plain TCP stream for WebSocket I/O."""
 
     var _is_tls: Bool
-    var _tls: TlsStream
-    var _tcp: TcpStream
+    var _tls: Optional[TlsStream]
+    var _tcp: Optional[TcpStream]
     var _network_scratch: List[UInt8]
     var _network_output: List[UInt8]
     var _network_output_offset: Int
@@ -35,8 +34,8 @@ struct _WsStream(Movable):
 
     def __init__(out self, var tls: TlsStream):
         self._is_tls = True
-        self._tls = tls^
-        self._tcp = _dummy_tcp_stream()
+        self._tls = Optional[TlsStream](tls^)
+        self._tcp = Optional[TcpStream]()
         self._network_scratch = List[UInt8]()
         self._network_output = List[UInt8]()
         self._network_output_offset = 0
@@ -46,10 +45,10 @@ struct _WsStream(Movable):
         self._pending_fence = 0
         self._ssl_write_pending = False
 
-    def __init__(out self, var tcp: TcpStream) raises:
+    def __init__(out self, var tcp: TcpStream):
         self._is_tls = False
-        self._tls = _dummy_tls_stream()
-        self._tcp = tcp^
+        self._tls = Optional[TlsStream]()
+        self._tcp = Optional[TcpStream](tcp^)
         self._network_scratch = List[UInt8]()
         self._network_output = List[UInt8]()
         self._network_output_offset = 0
@@ -62,30 +61,85 @@ struct _WsStream(Movable):
     def write_all(self, data: Span[UInt8, _]) raises:
         """Write all bytes to the active stream."""
         if self._is_tls:
-            self._tls.write_all(data)
+            self._tls.value().write_all(data)
             return
-        self._tcp.write_all(data)
+        self._tcp.value().write_all(data)
 
     def read(mut self, buf: Pointer[UInt8, _], size: Int) raises -> Int:
         """Read up to ``size`` bytes from the active stream."""
         if self._is_tls:
-            return self._tls.read(buf, size)
-        return self._tcp.read(buf, size)
+            return self._tls.value().read(buf, size)
+        return self._tcp.value().read(buf, size)
 
     def prepare_duplex(mut self) raises:
         """Put the owned socket in non-blocking mode for its owner loop."""
         if self._is_tls:
-            self._tls._set_nonblocking(True)
-            self._tls._enable_owner_bio()
+            self._tls.value()._set_nonblocking(True)
+            self._tls.value()._enable_owner_bio()
             self._network_scratch.resize(_OWNER_IO_CHUNK, UInt8(0))
             return
-        self._tcp._socket.set_nonblocking(True)
+        self._tcp.value()._socket.set_nonblocking(True)
+
+    def set_connect_nonblocking(mut self, enabled: Bool) raises:
+        """Toggle socket mode without changing the TLS BIO topology."""
+        if self._is_tls:
+            self._tls.value()._set_nonblocking(enabled)
+            return
+        self._tcp.value()._socket.set_nonblocking(enabled)
+
+    def connect_read_nonblocking(
+        mut self, buf: Pointer[UInt8, _], size: Int
+    ) raises -> Int:
+        """Advance one direct-socket read during the opening handshake."""
+        if self._is_tls:
+            return self._tls.value()._read_nonblocking(buf, size)
+        if size <= 0:
+            return 0
+        while True:
+            var received = _recv(self.fd(), buf, c_size_t(size), c_int(0))
+            if received > 0:
+                return Int(received)
+            if received == 0:
+                return _SSL_IO_CLOSED
+            var error = get_errno()
+            if error == ErrNo.EINTR:
+                continue
+            if error == ErrNo.EAGAIN or error == ErrNo.EWOULDBLOCK:
+                return _SSL_IO_WANT_READ
+            raise NetworkError(
+                "WebSocket upgrade receive failed with errno="
+                + String(Int(error.value))
+            )
+
+    def connect_write_nonblocking(mut self, data: Span[UInt8, _]) raises -> Int:
+        """Advance one direct-socket write during the opening handshake."""
+        if self._is_tls:
+            return self._tls.value()._write_nonblocking(data)
+        if len(data) == 0:
+            return 0
+        while True:
+            var sent = _send(
+                self.fd(), data.unsafe_ptr(), c_size_t(len(data)), MSG_NOSIGNAL
+            )
+            if sent > 0:
+                return Int(sent)
+            if sent == 0:
+                return _SSL_IO_CLOSED
+            var error = get_errno()
+            if error == ErrNo.EINTR:
+                continue
+            if error == ErrNo.EAGAIN or error == ErrNo.EWOULDBLOCK:
+                return _SSL_IO_WANT_WRITE
+            raise NetworkError(
+                "WebSocket upgrade send failed with errno="
+                + String(Int(error.value))
+            )
 
     def fd(self) -> c_int:
         """Return the owned socket descriptor."""
         if self._is_tls:
-            return self._tls._fd()
-        return self._tcp._socket.fd
+            return self._tls.value()._fd()
+        return self._tcp.value()._socket.fd
 
     def read_nonblocking(
         mut self, buf: Pointer[UInt8, _], size: Int
@@ -146,7 +200,7 @@ struct _WsStream(Movable):
 
     def _collect_tls_output(mut self) raises:
         while True:
-            var drained = self._tls._drain_owner_ciphertext(
+            var drained = self._tls.value()._drain_owner_ciphertext(
                 self._network_output, _OWNER_IO_CHUNK
             )
             if drained == 0:
@@ -197,7 +251,7 @@ struct _WsStream(Movable):
             )
             if received > 0:
                 var count = Int(received)
-                _ = self._tls._feed_owner_ciphertext(
+                _ = self._tls.value()._feed_owner_ciphertext(
                     Span[UInt8, _](
                         unsafe_ptr=self._network_scratch.unsafe_ptr(),
                         length=count,
@@ -230,7 +284,7 @@ struct _WsStream(Movable):
             return flush_result
 
         while True:
-            var received = self._tls._read_nonblocking(buf, size)
+            var received = self._tls.value()._read_nonblocking(buf, size)
             self._collect_tls_output()
             flush_result = self._flush_tls_output_once()
             if flush_result == _SSL_IO_CLOSED:
@@ -275,7 +329,7 @@ struct _WsStream(Movable):
             return 0
 
         while True:
-            var written = self._tls._write_nonblocking(data)
+            var written = self._tls.value()._write_nonblocking(data)
             self._collect_tls_output()
             flush_result = self._flush_tls_output_once()
             if flush_result == _SSL_IO_CLOSED:
@@ -303,30 +357,14 @@ struct _WsStream(Movable):
                 continue
             return ciphertext
 
-    def close(mut self):
-        """Close the active stream."""
+    def shutdown_graceful(mut self):
+        """Attempt TLS ``close_notify`` while retaining stream ownership."""
         if self._is_tls:
-            self._tls.close()
-            return
-        self._tcp.close()
+            self._tls.value()._shutdown_graceful()
 
     def close_abortive(mut self):
         """Close without a TLS shutdown exchange after terminal I/O."""
         if self._is_tls:
-            self._tls._close_abortive()
+            self._tls.value()._close_abortive()
             return
-        self._tcp.close()
-
-
-def _dummy_tcp_stream() -> TcpStream:
-    """Return an inert TCP stream for the inactive union branch."""
-    var socket = RawSocket(
-        c_int(INVALID_FD), c_int(AF_INET), c_int(SOCK_STREAM), True
-    )
-    return TcpStream(socket^, SocketAddr(IpAddr.localhost(), 0))
-
-
-def _dummy_tls_stream() raises -> TlsStream:
-    """Return an inert TLS stream for the inactive union branch."""
-    var tcp = _dummy_tcp_stream()
-    return TlsStream(tcp^, 0, 0)
+        self._tcp.value().close()

@@ -149,23 +149,44 @@ void flare_ssl_free(flare_ssl_t ssl) {
     if (ssl) SSL_free(static_cast<SSL*>(ssl));
 }
 
-int flare_ssl_connect(flare_ssl_t ssl, const char* server_name) {
-    ERR_clear_error();
+static void capture_handshake_error(SSL* ssl) {
+    capture_openssl_errors();
+    /* Annotate certificate verification failures with "verify:" prefix. */
+    long verify_err = SSL_get_verify_result(ssl);
+    if (verify_err != X509_V_OK) {
+        const char* reason = X509_verify_cert_error_string(verify_err);
+        last_error_msg = std::string("verify:") + reason;
+    }
+}
+
+int flare_ssl_prepare_connect(flare_ssl_t ssl, const char* server_name) {
     SSL* s = static_cast<SSL*>(ssl);
+    if (!s) {
+        set_error("ssl is null");
+        return -1;
+    }
+    ERR_clear_error();
     /* Always send SNI when a hostname (not IP) is given */
     if (server_name && server_name[0] != '\0') {
-        SSL_set_tlsext_host_name(s, server_name);
-        /* Also set hostname for certificate verification */
-        SSL_set1_host(s, server_name);
-    }
-    if (SSL_connect(s) != 1) {
-        capture_openssl_errors();
-        /* Annotate certificate verification failures with "verify:" prefix */
-        long verify_err = SSL_get_verify_result(s);
-        if (verify_err != X509_V_OK) {
-            const char* v = X509_verify_cert_error_string(verify_err);
-            last_error_msg = std::string("verify:") + v;
+        if (SSL_set_tlsext_host_name(s, server_name) != 1) {
+            capture_openssl_errors();
+            return -1;
         }
+        /* Also set hostname for certificate verification */
+        if (SSL_set1_host(s, server_name) != 1) {
+            capture_openssl_errors();
+            return -1;
+        }
+    }
+    SSL_set_connect_state(s);
+    return 0;
+}
+
+int flare_ssl_connect(flare_ssl_t ssl, const char* server_name) {
+    SSL* s = static_cast<SSL*>(ssl);
+    if (flare_ssl_prepare_connect(ssl, server_name) != 0) return -1;
+    if (SSL_connect(s) != 1) {
+        capture_handshake_error(s);
         return -1;
     }
     return 0;
@@ -683,7 +704,7 @@ int flare_ssl_do_handshake(flare_ssl_t ssl) {
     int err = SSL_get_error(s, rc);
     if (err == SSL_ERROR_WANT_READ)  return 1;
     if (err == SSL_ERROR_WANT_WRITE) return 2;
-    capture_openssl_errors();
+    capture_handshake_error(s);
     return -1;
 }
 

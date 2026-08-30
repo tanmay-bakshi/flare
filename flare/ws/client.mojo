@@ -17,13 +17,17 @@ of truth (this used to ship as three near-identical private
 encoders).
 """
 
+from std.collections import Optional
 from std.ffi import OwnedDLHandle, c_int
+from std.memory import ArcPointer, Pointer
+from std.memory.alloc import unsafe_alloc
 
 from ._duplex import (
     WsDuplex,
     WsReceiver,
     WsSender,
     WsShutdown,
+    _WsControl,
     _split_stream,
 )
 from ._message import WsMessage
@@ -31,11 +35,19 @@ from ._transport import _WsStream
 from .frame import WsFrame, WsOpcode, _encode_client_frame
 from ..crypto.base64 import base64_encode as _base64_encode
 from ..http.url import Url
-from ..tls import TlsStream, TlsConfig
+from ..tls import TlsConfig, TlsStream
+from ..tls.stream import (
+    _TlsClientHandshake,
+    _SSL_IO_WANT_READ,
+    _SSL_IO_WANT_WRITE,
+    _SSL_IO_CLOSED,
+)
 from ..tcp import TcpStream
-from ..tcp.stream import _connect_with_fallback
-from ..net import NetworkError, _find_flare_lib
-from ..dns import resolve
+from ..tcp.stream import _TcpConnectAttempt
+from ..net import DnsError, IpAddr, NetworkError, SocketAddr, _find_flare_lib
+from ..dns.async_resolve import ResolveCancellation, start_resolve
+from ..runtime._libc_time import monotonic_now_ns
+from ..runtime.event import Event, INTEREST_READ, INTEREST_WRITE
 from ..utils.dylib import dl_sym
 
 # RFC 6455 §1.3 magic GUID concatenated with the Sec-WebSocket-Key for SHA-1
@@ -43,6 +55,13 @@ comptime _WS_GUID: String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # OpenSSL SHA-1 digest length (20 bytes)
 comptime _SHA1_LEN: Int = 20
+
+# Reactor token used while one opening handshake owns the connection fd.
+comptime _WS_CONNECT_TOKEN: UInt64 = 2
+
+# Legacy ``WsClient.connect`` used a 5 second TCP timeout. Its compatibility
+# path now applies that same budget to the complete DNS-through-Upgrade dial.
+comptime _LEGACY_HANDSHAKE_TIMEOUT_MS: Int = 5000
 
 
 struct WsHandshakeError(Copyable, Movable, Writable):
@@ -172,68 +191,6 @@ def _ws_url_to_http(url: String) raises -> String:
     raise WsHandshakeError("URL must start with ws:// or wss://: " + url)
 
 
-def _read_line_tls(
-    mut stream: TlsStream, mut buf: List[UInt8]
-) raises -> String:
-    """Read one ``\\r\\n``-terminated line from a TLS stream.
-
-    Args:
-        stream: Open TLS stream.
-        buf: Scratch buffer (single-byte reads).
-
-    Returns:
-        Line content without the trailing ``\\r\\n``.
-
-    Raises:
-        NetworkError: On I/O error.
-    """
-    var line = String(capacity=256)
-    var b_buf = List[UInt8](capacity=1)
-    b_buf.append(UInt8(0))
-    while True:
-        var n = stream.read(b_buf.unsafe_ptr(), len(b_buf))
-        if n == 0:
-            break
-        var c = b_buf[0]
-        if c == 13:  # CR
-            continue
-        if c == 10:  # LF
-            break
-        line += chr(Int(c))
-    return line^
-
-
-def _read_line_tcp(
-    mut stream: TcpStream, mut buf: List[UInt8]
-) raises -> String:
-    """Read one ``\\r\\n``-terminated line from a TCP stream.
-
-    Args:
-        stream: Open TCP stream.
-        buf: Scratch buffer (single-byte reads).
-
-    Returns:
-        Line content without the trailing ``\\r\\n``.
-
-    Raises:
-        NetworkError: On I/O error.
-    """
-    var line = String(capacity=256)
-    var b_buf = List[UInt8](capacity=1)
-    b_buf.append(UInt8(0))
-    while True:
-        var n = stream.read(b_buf.unsafe_ptr(), len(b_buf))
-        if n == 0:
-            break
-        var c = b_buf[0]
-        if c == 13:
-            continue
-        if c == 10:
-            break
-        line += chr(Int(c))
-    return line^
-
-
 def _str_find_local(s: String, sub: String) -> Int:
     """Return the index of the first ``sub`` in ``s``, or -1."""
     var n = s.byte_length()
@@ -241,6 +198,27 @@ def _str_find_local(s: String, sub: String) -> Int:
     if m == 0:
         return 0
     for i in range(n - m + 1):
+        var ok = True
+        for j in range(m):
+            if s.unsafe_ptr()[i + j] != sub.unsafe_ptr()[j]:
+                ok = False
+                break
+        if ok:
+            return i
+    return -1
+
+
+def _str_find_from_local(s: String, sub: String, start: Int) -> Int:
+    """Return the first ``sub`` index at or after ``start``, or -1."""
+    var n = s.byte_length()
+    var m = sub.byte_length()
+    if start < 0 or start > n:
+        return -1
+    if m == 0:
+        return start
+    if m > n - start:
+        return -1
+    for i in range(start, n - m + 1):
         var ok = True
         for j in range(m):
             if s.unsafe_ptr()[i + j] != sub.unsafe_ptr()[j]:
@@ -261,6 +239,563 @@ def _lower_local(s: String) -> String:
         else:
             out += chr(Int(c))
     return out^
+
+
+def _cancel_resolve_address(address: Int):
+    """Cancel a boxed resolver capability published in ``_WsControl``."""
+    var pointer = Pointer[ResolveCancellation, MutUntrackedOrigin](
+        unsafe_from_address=address
+    )
+    pointer[].cancel()
+
+
+def _release_resolve_address(address: Int):
+    """Destroy a boxed resolver capability exactly once."""
+    var pointer = Pointer[ResolveCancellation, MutUntrackedOrigin](
+        unsafe_from_address=address
+    )
+    pointer.unsafe_deinit_pointee()
+    pointer.unsafe_free()
+
+
+def _control_error(control: ArcPointer[_WsControl]) -> NetworkError:
+    var message = control[].stopped_message()
+    if message == "":
+        message = "WebSocket connection stopped"
+    return NetworkError(message)
+
+
+def _expire_handshake(control: ArcPointer[_WsControl]) raises:
+    var message = "WebSocket opening handshake deadline expired"
+    control[].stop(message)
+    raise NetworkError(message)
+
+
+def _check_connect_running(
+    control: ArcPointer[_WsControl], deadline_ns: Int64
+) raises:
+    if control[].is_stopping():
+        raise _control_error(control)
+    if monotonic_now_ns() >= deadline_ns:
+        _expire_handshake(control)
+
+
+def _remaining_poll_ms(
+    control: ArcPointer[_WsControl], deadline_ns: Int64
+) raises -> Int:
+    _check_connect_running(control, deadline_ns)
+    var remaining_ns = deadline_ns - monotonic_now_ns()
+    if remaining_ns <= 0:
+        _expire_handshake(control)
+    var timeout_ms = Int(remaining_ns // 1_000_000)
+    if remaining_ns % 1_000_000 != 0:
+        timeout_ms += 1
+    # Reactor.poll lowers to a c_int timeout. Short slices also make a clock
+    # anomaly observable without weakening the one absolute deadline.
+    if timeout_ms > 1000:
+        return 1000
+    return timeout_ms
+
+
+def _wait_connect_fd(
+    control: ArcPointer[_WsControl],
+    fd: c_int,
+    interest: Int,
+    deadline_ns: Int64,
+) raises:
+    control[].reactor.modify(fd, interest)
+    var events = List[Event]()
+    while True:
+        var timeout_ms = _remaining_poll_ms(control, deadline_ns)
+        _ = control[].reactor.poll(timeout_ms, events)
+        _check_connect_running(control, deadline_ns)
+        for i in range(len(events)):
+            if (
+                not events[i].is_wakeup()
+                and events[i].token == _WS_CONNECT_TOKEN
+            ):
+                return
+
+
+def _unregister_connect_fd(control: ArcPointer[_WsControl], fd: c_int):
+    try:
+        control[].reactor.unregister(fd)
+    except:
+        pass
+
+
+def _close_tcp_owner(
+    control: ArcPointer[_WsControl], fd: c_int, mut tcp: TcpStream
+):
+    if control[].begin_owner_close(fd):
+        tcp.close()
+        control[].finish_owner_close()
+
+
+def _close_attempt_owner(
+    control: ArcPointer[_WsControl],
+    fd: c_int,
+    mut attempt: _TcpConnectAttempt,
+):
+    if control[].begin_owner_close(fd):
+        attempt.close()
+        control[].finish_owner_close()
+
+
+def _finish_tcp_attempt(
+    control: ArcPointer[_WsControl],
+    fd: c_int,
+    var attempt: _TcpConnectAttempt,
+) raises -> TcpStream:
+    """Finish a connected attempt without closing outside owner exclusion."""
+    try:
+        attempt.prepare_finish()
+    except error:
+        _unregister_connect_fd(control, fd)
+        _close_attempt_owner(control, fd, attempt)
+        if control[].is_stopping():
+            raise _control_error(control)
+        raise error^
+
+    if not control[].begin_owner_close(fd):
+        _unregister_connect_fd(control, fd)
+        attempt.close()
+        raise _control_error(control)
+
+    # The transfer cannot fail or close the fd. Keeping the registration intact
+    # avoids an unregister/register gap before TLS or Upgrade takes over.
+    var tcp = attempt^.finish()
+    control[].finish_owner_close()
+
+    if not control[].attach_fd(fd):
+        _unregister_connect_fd(control, fd)
+        tcp.close()
+        raise _control_error(control)
+    return tcp^
+
+
+def _connect_tcp_candidate(
+    control: ArcPointer[_WsControl],
+    peer: SocketAddr,
+    deadline_ns: Int64,
+) raises -> TcpStream:
+    var attempt = _TcpConnectAttempt.create(peer)
+    var fd = attempt.fd()
+    if not control[].attach_fd(fd):
+        attempt.close()
+        raise _control_error(control)
+
+    try:
+        control[].reactor.register(fd, _WS_CONNECT_TOKEN, INTEREST_WRITE)
+    except error:
+        _close_attempt_owner(control, fd, attempt)
+        raise error^
+
+    try:
+        var complete = attempt.start()
+        if not complete:
+            _wait_connect_fd(control, fd, INTEREST_WRITE, deadline_ns)
+            attempt.complete_ready()
+        _check_connect_running(control, deadline_ns)
+    except error:
+        _unregister_connect_fd(control, fd)
+        _close_attempt_owner(control, fd, attempt)
+        if control[].is_stopping():
+            raise _control_error(control)
+        raise error^
+
+    return _finish_tcp_attempt(control, fd, attempt^)
+
+
+def _resolve_connect_host(
+    control: ArcPointer[_WsControl], host: String, deadline_ns: Int64
+) raises -> List[IpAddr]:
+    _check_connect_running(control, deadline_ns)
+    var request = start_resolve(host)
+    var cancellation = request.cancellation()
+    var boxed = unsafe_alloc[ResolveCancellation](1)
+    boxed.unsafe_write(cancellation^)
+    var address = Int(boxed)
+    if not control[].install_resolver_request(
+        address, _cancel_resolve_address, _release_resolve_address
+    ):
+        raise _control_error(control)
+
+    var result: List[IpAddr]
+    try:
+        result = request.wait_until(deadline_ns)
+    except error:
+        control[].clear_resolver_request(address)
+        if control[].is_stopping():
+            raise _control_error(control)
+        if monotonic_now_ns() >= deadline_ns:
+            _expire_handshake(control)
+        raise error^
+    control[].clear_resolver_request(address)
+    _check_connect_running(control, deadline_ns)
+    return result^
+
+
+def _establish_tls(
+    control: ArcPointer[_WsControl],
+    host: String,
+    config: TlsConfig,
+    deadline_ns: Int64,
+    var tcp: TcpStream,
+) raises -> TlsStream:
+    var fd = tcp._socket.fd
+    var pending: Optional[_TlsClientHandshake]
+    try:
+        pending = Optional[_TlsClientHandshake](
+            _TlsClientHandshake.start(fd, host, config)
+        )
+    except error:
+        _unregister_connect_fd(control, fd)
+        _close_tcp_owner(control, fd, tcp)
+        if control[].is_stopping():
+            raise _control_error(control)
+        raise error^
+
+    var handshake = pending.take()
+    try:
+        while True:
+            _check_connect_running(control, deadline_ns)
+            var step = handshake.step(host)
+            if step == 0:
+                break
+            var interest = (
+                INTEREST_READ if step == _SSL_IO_WANT_READ else INTEREST_WRITE
+            )
+            _wait_connect_fd(control, fd, interest, deadline_ns)
+    except error:
+        handshake.close_abortive()
+        _unregister_connect_fd(control, fd)
+        _close_tcp_owner(control, fd, tcp)
+        if control[].is_stopping():
+            raise _control_error(control)
+        raise error^
+
+    try:
+        handshake.prepare_finish(tcp._socket.fd)
+    except error:
+        handshake.close_abortive()
+        _unregister_connect_fd(control, fd)
+        _close_tcp_owner(control, fd, tcp)
+        if control[].is_stopping():
+            raise _control_error(control)
+        raise error^
+
+    if not control[].begin_owner_close(fd):
+        handshake.close_abortive()
+        _unregister_connect_fd(control, fd)
+        tcp.close()
+        raise _control_error(control)
+
+    var tls = handshake^.finish(tcp^)
+    control[].finish_owner_close()
+
+    if not control[].attach_fd(fd):
+        _unregister_connect_fd(control, fd)
+        tls._close_abortive()
+        raise _control_error(control)
+    return tls^
+
+
+def _headers_complete(bytes: List[UInt8]) -> Bool:
+    var size = len(bytes)
+    return (
+        size >= 4
+        and bytes[size - 4] == UInt8(13)
+        and bytes[size - 3] == UInt8(10)
+        and bytes[size - 2] == UInt8(13)
+        and bytes[size - 1] == UInt8(10)
+    )
+
+
+def _validate_upgrade_response(
+    bytes: List[UInt8], expected_accept: String
+) raises:
+    var response = String(unsafe_from_utf8=Span[UInt8, _](bytes))
+    var line_end = _str_find_from_local(response, "\r\n", 0)
+    if line_end < 0:
+        raise WsHandshakeError("truncated HTTP Upgrade response")
+    var status_line = String(unsafe_from_utf8=response.as_bytes()[:line_end])
+    if not status_line.startswith("HTTP/1.1 101"):
+        raise WsHandshakeError(
+            "Expected 101 Switching Protocols, got: " + status_line
+        )
+
+    var accept_header = String("")
+    var line_start = line_end + 2
+    while line_start < response.byte_length():
+        line_end = _str_find_from_local(response, "\r\n", line_start)
+        if line_end < 0:
+            raise WsHandshakeError("truncated HTTP Upgrade response")
+        if line_end == line_start:
+            break
+        var line = String(
+            unsafe_from_utf8=response.as_bytes()[line_start:line_end]
+        )
+        var colon = _str_find_local(line, ":")
+        if colon >= 0:
+            var name = _lower_local(
+                String(String(unsafe_from_utf8=line.as_bytes()[:colon]).strip())
+            )
+            if name == "sec-websocket-accept":
+                accept_header = String(
+                    String(
+                        unsafe_from_utf8=line.as_bytes()[colon + 1 :]
+                    ).strip()
+                )
+        line_start = line_end + 2
+
+    if accept_header != expected_accept:
+        raise WsHandshakeError(
+            "Sec-WebSocket-Accept mismatch: got '"
+            + accept_header
+            + "', expected '"
+            + expected_accept
+            + "'"
+        )
+
+
+def _drive_upgrade(
+    control: ArcPointer[_WsControl],
+    mut stream: _WsStream,
+    request: String,
+    expected_accept: String,
+    deadline_ns: Int64,
+) raises:
+    var request_bytes = List[UInt8](request.as_bytes())
+    var offset = 0
+    while offset < len(request_bytes):
+        _check_connect_running(control, deadline_ns)
+        var written = stream.connect_write_nonblocking(
+            Span[UInt8, _](request_bytes)[offset:]
+        )
+        if written > 0:
+            offset += written
+            continue
+        if written == _SSL_IO_CLOSED:
+            raise NetworkError(
+                "WebSocket connection closed during opening request"
+            )
+        var interest = (
+            INTEREST_READ if written == _SSL_IO_WANT_READ else INTEREST_WRITE
+        )
+        _wait_connect_fd(control, stream.fd(), interest, deadline_ns)
+
+    var response = List[UInt8](capacity=512)
+    var byte = List[UInt8](capacity=1)
+    byte.append(UInt8(0))
+    while not _headers_complete(response):
+        _check_connect_running(control, deadline_ns)
+        var received = stream.connect_read_nonblocking(byte.unsafe_ptr(), 1)
+        if received > 0:
+            response.append(byte[0])
+            continue
+        if received == _SSL_IO_CLOSED:
+            raise NetworkError(
+                "WebSocket connection closed during Upgrade response"
+            )
+        var interest = (
+            INTEREST_WRITE if received == _SSL_IO_WANT_WRITE else INTEREST_READ
+        )
+        _wait_connect_fd(control, stream.fd(), interest, deadline_ns)
+
+    _validate_upgrade_response(response, expected_accept)
+
+
+def _close_stream_owner(control: ArcPointer[_WsControl], mut stream: _WsStream):
+    var fd = stream.fd()
+    if control[].begin_owner_close(fd):
+        stream.close_abortive()
+        control[].finish_owner_close()
+
+
+def _close_stream_gracefully_owner(
+    control: ArcPointer[_WsControl], mut stream: _WsStream
+):
+    """Attempt protocol shutdown before owner-excluded final reclamation."""
+    var fd = stream.fd()
+    if fd < c_int(0):
+        return
+    # SSL_shutdown may wait for the peer's close_notify. The fd stays
+    # published so the independent shutdown capability can interrupt it.
+    stream.shutdown_graceful()
+    if control[].begin_owner_close(fd):
+        stream.close_abortive()
+        control[].finish_owner_close()
+
+
+def _opening_deadline_ns(handshake_timeout_ms: Int) raises -> Int64:
+    if handshake_timeout_ms <= 0:
+        raise WsHandshakeError(
+            "handshake_timeout_ms must be a positive explicit timeout"
+        )
+    if handshake_timeout_ms > Int(Int64.MAX // 1_000_000):
+        raise WsHandshakeError("handshake_timeout_ms is too large")
+    var now = monotonic_now_ns()
+    var budget = Int64(handshake_timeout_ms) * 1_000_000
+    if now > Int64.MAX - budget:
+        raise WsHandshakeError("handshake deadline overflows Int64")
+    return now + budget
+
+
+def _connect_with_control(
+    url: String,
+    config: TlsConfig,
+    extra_headers: List[String],
+    deadline_ns: Int64,
+    control: ArcPointer[_WsControl],
+) raises -> WsClient:
+    """Drive DNS, TCP, TLS, and Upgrade under one cancellation authority."""
+    _check_connect_running(control, deadline_ns)
+    var http_url = _ws_url_to_http(url)
+    var parsed = Url.parse(http_url)
+    var key = _generate_ws_key()
+    var expected_accept = _compute_accept(key)
+    var tls_config = config.copy()
+    if parsed.is_tls() and len(tls_config.alpn) == 0:
+        tls_config.alpn = ["http/1.1"]
+
+    var host_header = parsed.host
+    if (parsed.scheme == "http" and parsed.port != 80) or (
+        parsed.scheme == "https" and parsed.port != 443
+    ):
+        host_header = host_header + ":" + String(Int(parsed.port))
+
+    var request = (
+        "GET "
+        + parsed.request_target()
+        + " HTTP/1.1\r\n"
+        + "Host: "
+        + host_header
+        + "\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Sec-WebSocket-Key: "
+        + key
+        + "\r\n"
+        + "Sec-WebSocket-Version: 13\r\n"
+    )
+    for i in range(len(extra_headers)):
+        if "\r" in extra_headers[i] or "\n" in extra_headers[i]:
+            raise WsHandshakeError(
+                "extra header lines must not contain CR or LF"
+            )
+        request += extra_headers[i] + "\r\n"
+    request += "\r\n"
+
+    var addresses = _resolve_connect_host(control, parsed.host, deadline_ns)
+    if len(addresses) == 0:
+        raise DnsError("DNS resolution returned no results for: " + parsed.host)
+
+    var connected = Optional[TcpStream]()
+    var last_error = String("")
+    for i in range(len(addresses)):
+        try:
+            connected = Optional[TcpStream](
+                _connect_tcp_candidate(
+                    control,
+                    SocketAddr(addresses[i], parsed.port),
+                    deadline_ns,
+                )
+            )
+            break
+        except error:
+            if control[].is_stopping():
+                raise _control_error(control)
+            if monotonic_now_ns() >= deadline_ns:
+                _expire_handshake(control)
+            last_error = String(error)
+    if not connected:
+        _check_connect_running(control, deadline_ns)
+        raise NetworkError(
+            "all addresses failed for " + parsed.host + ": " + last_error
+        )
+
+    var tcp = connected.take()
+    var stream: _WsStream
+    if parsed.is_tls():
+        var tls = _establish_tls(
+            control,
+            parsed.host,
+            tls_config,
+            deadline_ns,
+            tcp^,
+        )
+        stream = _WsStream(tls^)
+    else:
+        stream = _WsStream(tcp^)
+
+    try:
+        _drive_upgrade(control, stream, request, expected_accept, deadline_ns)
+        stream.set_connect_nonblocking(False)
+        _check_connect_running(control, deadline_ns)
+        control[].reactor.unregister(stream.fd())
+        if not control[].claim_publication():
+            _close_stream_owner(control, stream)
+            raise _control_error(control)
+    except error:
+        _unregister_connect_fd(control, stream.fd())
+        _close_stream_owner(control, stream)
+        if control[].is_stopping():
+            raise _control_error(control)
+        raise error^
+
+    return WsClient(stream^, key^, control)
+
+
+struct WsConnectAttempt(Movable):
+    """Linear opening attempt whose shutdown handle exists before dialing."""
+
+    var _url: String
+    var _config: TlsConfig
+    var _extra_headers: List[String]
+    var _deadline_ns: Int64
+    var _control: ArcPointer[_WsControl]
+    var _shutdown_taken: Bool
+
+    def __init__(
+        out self,
+        url: String,
+        config: TlsConfig,
+        extra_headers: List[String],
+        deadline_ns: Int64,
+        control: ArcPointer[_WsControl],
+    ):
+        self._url = url
+        self._config = config.copy()
+        self._extra_headers = extra_headers.copy()
+        self._deadline_ns = deadline_ns
+        self._control = control
+        self._shutdown_taken = False
+
+    def __deinit__(deinit self):
+        self._control[].stop("WebSocket connect attempt abandoned")
+
+    def take_shutdown(mut self) raises -> WsShutdown:
+        """Take the independent shutdown capability exactly once."""
+        if self._shutdown_taken:
+            raise Error("WsConnectAttempt shutdown already taken")
+        self._shutdown_taken = True
+        return WsShutdown(self._control)
+
+    def connect(deinit self) raises -> WsClient:
+        """Consume this attempt and publish only a fully upgraded client."""
+        try:
+            return _connect_with_control(
+                self._url,
+                self._config,
+                self._extra_headers,
+                self._deadline_ns,
+                self._control,
+            )
+        except error:
+            var message = String(error)
+            self._control[].stop(message)
+            raise error^
 
 
 struct WsClient(Movable):
@@ -288,13 +823,20 @@ struct WsClient(Movable):
 
     var _stream: _WsStream
     var _key: String
+    var _control: ArcPointer[_WsControl]
 
-    def __init__(out self, var stream: _WsStream, key: String):
+    def __init__(
+        out self,
+        var stream: _WsStream,
+        key: String,
+        control: ArcPointer[_WsControl],
+    ):
         self._stream = stream^
         self._key = key
+        self._control = control
 
     def __deinit__(deinit self):
-        self._stream.close()
+        _close_stream_owner(self._control, self._stream)
 
     def split(deinit self) raises -> WsDuplex:
         """Split an established connection into two I/O halves and shutdown.
@@ -309,7 +851,7 @@ struct WsClient(Movable):
         while sends are in flight. No internal thread is created.
         """
         _ = self._key^
-        return _split_stream(self._stream^)
+        return _split_stream(self._stream^, self._control)
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -331,7 +873,12 @@ struct WsClient(Movable):
             NetworkError: If the TCP/TLS connection fails.
             WsHandshakeError: If the server's Upgrade response is invalid.
         """
-        return WsClient._connect_impl(url, TlsConfig(), extra_headers)
+        var attempt = WsClient.connect_attempt(
+            url,
+            _LEGACY_HANDSHAKE_TIMEOUT_MS,
+            extra_headers=extra_headers,
+        )
+        return attempt^.connect()
 
     @staticmethod
     def connect(
@@ -355,174 +902,58 @@ struct WsClient(Movable):
             WsHandshakeError: If the server's Upgrade response is invalid or
                               ``Sec-WebSocket-Accept`` does not match.
         """
-        return WsClient._connect_impl(url, config, extra_headers)
+        var attempt = WsClient.connect_attempt(
+            url,
+            config,
+            _LEGACY_HANDSHAKE_TIMEOUT_MS,
+            extra_headers=extra_headers,
+        )
+        return attempt^.connect()
 
     @staticmethod
-    def _connect_impl(
+    def connect_attempt(
+        url: String,
+        handshake_timeout_ms: Int,
+        extra_headers: List[String] = [],
+    ) raises -> WsConnectAttempt:
+        """Create a cancellable attempt using default TLS configuration.
+
+        ``handshake_timeout_ms`` is required, positive, and covers one
+        absolute DNS-through-Upgrade interval. No network operation starts
+        until :meth:`WsConnectAttempt.connect` is called.
+        """
+        var deadline_ns = _opening_deadline_ns(handshake_timeout_ms)
+        var control = ArcPointer[_WsControl](_WsControl())
+        return WsConnectAttempt(
+            url,
+            TlsConfig(),
+            extra_headers,
+            deadline_ns,
+            control,
+        )
+
+    @staticmethod
+    def connect_attempt(
         url: String,
         config: TlsConfig,
-        extra_headers: List[String],
-    ) raises -> WsClient:
-        """Internal implementation shared by both ``connect`` overloads.
+        handshake_timeout_ms: Int,
+        extra_headers: List[String] = [],
+    ) raises -> WsConnectAttempt:
+        """Create a cancellable attempt using a custom TLS configuration.
 
-        For ``wss://`` URLs, advertises ALPN ``["http/1.1"]``
-        explicitly so the unified
-        :class:`flare.http.HttpServer` (which auto-dispatches
-        HTTP/1.1 vs HTTP/2 based on ALPN selection) negotiates
-        the existing HTTP/1.1 Upgrade dance instead of HTTP/2.
-        WebSocket-over-HTTP/2 (RFC 8441 Extended CONNECT) is
-        wired on the server byte-driver side
-        (:class:`flare.http2.Http2Connection` advertises
-        ``SETTINGS_ENABLE_CONNECT_PROTOCOL`` when opted in via
-        ``Http2Config.enable_connect_protocol`` and captures
-        the inbound ``:protocol`` pseudo-header on the stream)
-        but the per-stream WS tunnel adapter that bridges
-        DATA frames to :class:`WsConnection` is the deliberate
-        follow-up; until it lands, ``WsClient`` forces the
-        HTTP/1.1 path so existing wss:// users see no
-        regression.
+        ``handshake_timeout_ms`` is required, positive, and covers one
+        absolute DNS-through-Upgrade interval. No network operation starts
+        until :meth:`WsConnectAttempt.connect` is called.
         """
-        var http_url = _ws_url_to_http(url)
-        var u = Url.parse(http_url)
-        var key = _generate_ws_key()
-        var expected_accept = _compute_accept(key)
-        # Force HTTP/1.1 ALPN on wss:// so the unified server
-        # routes to the Upgrade-based path. (When the WS-over-h2
-        # tunnel adapter lands we'll change this to ["h2",
-        # "http/1.1"] and add a negotiated-h2 branch above the
-        # existing wire.)
-        var tls_cfg = config.copy()
-        if u.is_tls() and len(tls_cfg.alpn) == 0:
-            tls_cfg.alpn = List[String]()
-            tls_cfg.alpn.append("http/1.1")
-
-        # ── 1. Build upgrade request ──────────────────────────────────────────
-        var host_header = u.host
-        if (u.scheme == "http" and u.port != 80) or (
-            u.scheme == "https" and u.port != 443
-        ):
-            host_header = host_header + ":" + String(Int(u.port))
-
-        var req = (
-            "GET "
-            + u.request_target()
-            + " HTTP/1.1\r\n"
-            + "Host: "
-            + host_header
-            + "\r\n"
-            + "Upgrade: websocket\r\n"
-            + "Connection: Upgrade\r\n"
-            + "Sec-WebSocket-Key: "
-            + key
-            + "\r\n"
-            + "Sec-WebSocket-Version: 13\r\n"
+        var deadline_ns = _opening_deadline_ns(handshake_timeout_ms)
+        var control = ArcPointer[_WsControl](_WsControl())
+        return WsConnectAttempt(
+            url,
+            config,
+            extra_headers,
+            deadline_ns,
+            control,
         )
-        for i in range(len(extra_headers)):
-            if ("\r" in extra_headers[i]) or ("\n" in extra_headers[i]):
-                raise WsHandshakeError(
-                    "extra header lines must not contain CR or LF"
-                )
-            req += extra_headers[i] + "\r\n"
-        req += "\r\n"
-
-        # ── 2. Connect and send ───────────────────────────────────────────────
-        var scratch = List[UInt8](capacity=1)
-        scratch.append(UInt8(0))
-
-        if u.is_tls():
-            var tls = TlsStream.connect(u.host, u.port, tls_cfg^)
-            var req_bytes = req.as_bytes()
-            tls.write_all(Span[UInt8, _](req_bytes))
-
-            # ── 3. Read response headers ──────────────────────────────────────
-            var status_line = _read_line_tls(tls, scratch)
-            if not status_line.startswith("HTTP/1.1 101"):
-                raise WsHandshakeError(
-                    "Expected 101 Switching Protocols, got: " + status_line
-                )
-
-            var accept_header = String("")
-            while True:
-                var line = _read_line_tls(tls, scratch)
-                if line.byte_length() == 0:
-                    break
-                var colon = _str_find_local(line, ":")
-                if colon >= 0:
-                    var hk = _lower_local(
-                        String(
-                            String(
-                                String(unsafe_from_utf8=line.as_bytes()[:colon])
-                            ).strip()
-                        )
-                    )
-                    var hv = String(
-                        String(
-                            String(
-                                unsafe_from_utf8=line.as_bytes()[colon + 1 :]
-                            )
-                        ).strip()
-                    )
-                    if hk == "sec-websocket-accept":
-                        accept_header = hv
-
-            # ── 4. Verify Sec-WebSocket-Accept ────────────────────────────────
-            if accept_header != expected_accept:
-                raise WsHandshakeError(
-                    "Sec-WebSocket-Accept mismatch: got '"
-                    + accept_header
-                    + "', expected '"
-                    + expected_accept
-                    + "'"
-                )
-
-            var ws_stream = _WsStream(tls^)
-            return WsClient(ws_stream^, key)
-        else:
-            var tcp = _connect_with_fallback(u.host, u.port, 5000)
-            var req_bytes = req.as_bytes()
-            tcp.write_all(Span[UInt8, _](req_bytes))
-
-            var status_line = _read_line_tcp(tcp, scratch)
-            if not status_line.startswith("HTTP/1.1 101"):
-                raise WsHandshakeError(
-                    "Expected 101 Switching Protocols, got: " + status_line
-                )
-
-            var accept_header = String("")
-            while True:
-                var line = _read_line_tcp(tcp, scratch)
-                if line.byte_length() == 0:
-                    break
-                var colon = _str_find_local(line, ":")
-                if colon >= 0:
-                    var hk = _lower_local(
-                        String(
-                            String(
-                                String(unsafe_from_utf8=line.as_bytes()[:colon])
-                            ).strip()
-                        )
-                    )
-                    var hv = String(
-                        String(
-                            String(
-                                unsafe_from_utf8=line.as_bytes()[colon + 1 :]
-                            )
-                        ).strip()
-                    )
-                    if hk == "sec-websocket-accept":
-                        accept_header = hv
-
-            if accept_header != expected_accept:
-                raise WsHandshakeError(
-                    "Sec-WebSocket-Accept mismatch: got '"
-                    + accept_header
-                    + "', expected '"
-                    + expected_accept
-                    + "'"
-                )
-
-            var ws_stream = _WsStream(tcp^)
-            return WsClient(ws_stream^, key)
 
     # ── Sending ───────────────────────────────────────────────────────────────
 
@@ -667,10 +1098,14 @@ struct WsClient(Movable):
 
         Idempotent — safe to call multiple times.
         """
+        if self._stream.fd() < c_int(0):
+            return
         try:
             var close_frame = WsFrame.close()
             var wire = _encode_client_frame(close_frame)
             self._stream.write_all(Span[UInt8, _](wire))
         except:
-            pass  # best-effort
-        self._stream.close()
+            # OpenSSL forbids SSL_shutdown after a terminal SSL I/O failure.
+            _close_stream_owner(self._control, self._stream)
+            return
+        _close_stream_gracefully_owner(self._control, self._stream)

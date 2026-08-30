@@ -205,6 +205,27 @@ def _do_ssl_connect(
     return rc
 
 
+def _do_ssl_prepare_connect(
+    imm lib: OwnedDLHandle, ssl: Int, var sni: String
+) raises -> Int:
+    """Prepare a client SSL session for stepwise reactor driving."""
+    var f = dl_sym[def(Int, Int) thin abi("C") -> c_int](
+        lib, "flare_ssl_prepare_connect"
+    )
+    var cstr = sni.as_c_string_slice()
+    var rc = Int(f(ssl, Int(cstr.unsafe_ptr())))
+    _ = sni^
+    return rc
+
+
+def _do_ssl_handshake_step(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
+    """Advance a prepared TLS handshake by one non-blocking step."""
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](
+        lib, "flare_ssl_do_handshake"
+    )
+    return Int(f(ssl))
+
+
 def _do_ssl_read(
     imm lib: OwnedDLHandle,
     ssl: Int,
@@ -461,6 +482,53 @@ def _build_ssl_ctx(imm lib: OwnedDLHandle, config: TlsConfig) raises -> Int:
     return ctx
 
 
+def _build_client_ssl_ctx(
+    imm lib: OwnedDLHandle, config: TlsConfig
+) raises -> Int:
+    """Build the complete client context shared by blocking and reactor dials.
+    """
+    var ctx = _build_ssl_ctx(lib, config)
+
+    if config.cert_file != "" and config.key_file != "":
+        if (
+            _do_ssl_ctx_load_cert_key(
+                lib, ctx, config.cert_file, config.key_file
+            )
+            != 0
+        ):
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError("mTLS cert/key load failed: " + err)
+
+    if len(config.alpn) > 0:
+        var blob = List[UInt8]()
+        for i in range(len(config.alpn)):
+            var protocol = config.alpn[i]
+            var size = protocol.byte_length()
+            if size == 0 or size > 255:
+                _do_ssl_ctx_free(lib, ctx)
+                raise TlsHandshakeError(
+                    "TlsConfig.alpn: each protocol id must be 1..255"
+                    " bytes (RFC 7301)"
+                )
+            blob.append(UInt8(size))
+            var bytes = protocol.unsafe_ptr()
+            for j in range(size):
+                blob.append(bytes[j])
+        if len(blob) > 255:
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError(
+                "TlsConfig.alpn: wire-format protos blob must be"
+                " <= 255 bytes total"
+            )
+        if _do_ssl_ctx_set_alpn_protos(lib, ctx, blob) != 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError("ALPN setup failed: " + err)
+
+    return ctx
+
+
 struct TlsSession(Movable):
     """Opaque, reusable TLS session handle (RFC 5077 / RFC 8446
     §4.6.1) captured from a completed TLS handshake.
@@ -505,6 +573,112 @@ struct TlsSession(Movable):
         :meth:`TlsStream.connect_resumed`.
         """
         return self._addr
+
+
+struct _TlsClientHandshake(Movable):
+    """Linear owner of one reactor-driven client TLS handshake."""
+
+    var _fd: c_int
+    var _ctx: Int
+    var _ssl: Int
+    var _lib: OwnedDLHandle
+    var _complete: Bool
+
+    def __init__(
+        out self,
+        fd: c_int,
+        ctx: Int,
+        ssl: Int,
+        var lib: OwnedDLHandle,
+    ):
+        self._fd = fd
+        self._ctx = ctx
+        self._ssl = ssl
+        self._lib = lib^
+        self._complete = False
+
+    def __deinit__(deinit self):
+        if self._ssl != 0:
+            try:
+                _do_ssl_free(self._lib, self._ssl)
+                _do_ssl_ctx_free(self._lib, self._ctx)
+            except:
+                pass
+
+    @staticmethod
+    def start(fd: c_int, host: String, config: TlsConfig) raises -> Self:
+        """Prepare TLS state without entering a blocking OpenSSL call."""
+        if config.verify == TlsVerify.NONE:
+            print(
+                (
+                    "[flare TLS SECURITY WARNING] Certificate verification is"
+                    " disabled. This connection is vulnerable to"
+                    " man-in-the-middle attacks. Never use TlsConfig.insecure()"
+                    " in production."
+                ),
+                file=stderr,
+            )
+
+        var lib = OwnedDLHandle(_find_flare_lib())
+        var ctx = _build_client_ssl_ctx(lib, config)
+        var ssl = _do_ssl_new(lib, ctx, fd)
+        if ssl == 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError(err)
+
+        var sni = config.server_name if config.server_name != "" else host
+        if _do_ssl_prepare_connect(lib, ssl, sni) != 0:
+            var err = _c_err(lib)
+            _do_ssl_free(lib, ssl)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError(err)
+
+        return Self(fd, ctx, ssl, lib^)
+
+    def fd(self) -> c_int:
+        """Return the socket descriptor watched by the caller's reactor."""
+        return self._fd
+
+    def close_abortive(mut self):
+        """Reclaim partial TLS state without touching the caller-owned fd."""
+        if self._ssl != 0:
+            try:
+                _do_ssl_free(self._lib, self._ssl)
+                _do_ssl_ctx_free(self._lib, self._ctx)
+            except:
+                pass
+            self._ssl = 0
+            self._ctx = 0
+        self._complete = False
+
+    def step(mut self, host: String) raises -> Int:
+        """Advance once: 0 complete, 1 WANT_READ, 2 WANT_WRITE."""
+        if self._complete:
+            return 0
+        var result = _do_ssl_handshake_step(self._lib, self._ssl)
+        if result == 0:
+            self._complete = True
+            return 0
+        if result == 1 or result == 2:
+            return result
+        var err = _c_err(self._lib)
+        _classify_tls_error(err, host)
+        raise TlsHandshakeError(err)
+
+    def prepare_finish(self, tcp_fd: c_int) raises:
+        """Validate the transfer while the caller still owns a live fd."""
+        if not self._complete:
+            raise TlsHandshakeError("TLS handshake is not complete")
+        if tcp_fd != self._fd:
+            raise TlsHandshakeError("TLS handshake fd ownership mismatch")
+
+    def finish(deinit self, var tcp: TcpStream) -> TlsStream:
+        """Transfer a validated session into its steady-state stream."""
+        var ctx = self._ctx
+        var ssl = self._ssl
+        var lib = self._lib^
+        return TlsStream(tcp^, ctx, ssl, lib^)
 
 
 struct TlsStream(Movable, Readable):
@@ -566,6 +740,19 @@ struct TlsStream(Movable, Readable):
         self._ctx = ctx
         self._ssl = ssl
         self._lib = OwnedDLHandle(_find_flare_lib())
+
+    def __init__(
+        out self,
+        var tcp: TcpStream,
+        ctx: Int,
+        ssl: Int,
+        var lib: OwnedDLHandle,
+    ):
+        """Internal constructor retaining an already-open FFI library."""
+        self._tcp = tcp^
+        self._ctx = ctx
+        self._ssl = ssl
+        self._lib = lib^
 
     def __deinit__(deinit self):
         """Send ``close_notify`` and free OpenSSL objects (best-effort)."""
@@ -636,56 +823,17 @@ struct TlsStream(Movable, Readable):
         # ── 2. Load OpenSSL wrapper library ───────────────────────────────────
         var lib = OwnedDLHandle(_find_flare_lib())
 
-        # ── 3. SSL_CTX + security policy + verify + CA bundle ────────────────
-        var ctx = _build_ssl_ctx(lib, config)
+        # ── 3. Complete client context (policy, mTLS, ALPN) ──────────────────
+        var ctx = _build_client_ssl_ctx(lib, config)
 
-        # ── 4. mTLS: load client cert + key if provided ──────────────────────
-        if config.cert_file != "" and config.key_file != "":
-            if (
-                _do_ssl_ctx_load_cert_key(
-                    lib, ctx, config.cert_file, config.key_file
-                )
-                != 0
-            ):
-                var err = _c_err(lib)
-                _do_ssl_ctx_free(lib, ctx)
-                raise TlsHandshakeError("mTLS cert/key load failed: " + err)
-
-        # ── 5. Client-side ALPN (RFC 7301) ──────────────────────────────────
-        if len(config.alpn) > 0:
-            var blob = List[UInt8]()
-            for i in range(len(config.alpn)):
-                var p = config.alpn[i]
-                var n = p.byte_length()
-                if n == 0 or n > 255:
-                    _do_ssl_ctx_free(lib, ctx)
-                    raise TlsHandshakeError(
-                        "TlsConfig.alpn: each protocol id must be 1..255"
-                        " bytes (RFC 7301)"
-                    )
-                blob.append(UInt8(n))
-                var pp = p.unsafe_ptr()
-                for j in range(n):
-                    blob.append(pp[j])
-            if len(blob) > 255:
-                _do_ssl_ctx_free(lib, ctx)
-                raise TlsHandshakeError(
-                    "TlsConfig.alpn: wire-format protos blob must be"
-                    " <= 255 bytes total"
-                )
-            if _do_ssl_ctx_set_alpn_protos(lib, ctx, blob) != 0:
-                var err = _c_err(lib)
-                _do_ssl_ctx_free(lib, ctx)
-                raise TlsHandshakeError("ALPN setup failed: " + err)
-
-        # ── 6. Create SSL session bound to the TCP fd ─────────────────────────
+        # ── 4. Create SSL session bound to the TCP fd ─────────────────────────
         var ssl = _do_ssl_new(lib, ctx, tcp._socket.fd)
         if ssl == 0:
             var err = _c_err(lib)
             _do_ssl_ctx_free(lib, ctx)
             raise TlsHandshakeError(err)
 
-        # ── 7. TLS handshake (flare_ssl_connect sends SNI) ────────────────────
+        # ── 5. TLS handshake (flare_ssl_connect sends SNI) ────────────────────
         var sni = config.server_name if config.server_name != "" else host
         if _do_ssl_connect(lib, ssl, sni) != 0:
             var err = _c_err(lib)
@@ -695,7 +843,7 @@ struct TlsStream(Movable, Readable):
             # _classify_tls_error always raises; unreachable:
             raise TlsHandshakeError(err)
 
-        return TlsStream(tcp^, ctx, ssl)
+        return TlsStream(tcp^, ctx, ssl, lib^)
 
     @staticmethod
     def connect_timeout(
@@ -1189,6 +1337,21 @@ struct TlsStream(Movable, Readable):
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    def _shutdown_graceful(mut self):
+        """Attempt ``close_notify`` without releasing TLS or fd ownership.
+
+        WebSocket cancellation must be able to interrupt this potentially
+        blocking exchange with ``shutdown(SHUT_RDWR)``. The caller retains
+        ownership and separately serializes the final TLS release and fd close
+        against descriptor reuse.
+        """
+        if self._ssl == 0:
+            return
+        try:
+            _ = _do_ssl_shutdown(self._lib, self._ssl)
+        except:
+            pass
+
     def close(mut self):
         """Send ``close_notify`` and close the underlying TCP stream.
 
@@ -1196,24 +1359,15 @@ struct TlsStream(Movable, Readable):
         this, so explicit ``close()`` is not required.
         """
         if self._ssl != 0:
-            # Use the connection-cached handle (valid for the stream's
-            # lifetime) rather than reopening per close.
-            try:
-                _ = _do_ssl_shutdown(self._lib, self._ssl)
-                _do_ssl_free(self._lib, self._ssl)
-                _do_ssl_ctx_free(self._lib, self._ctx)
-            except:
-                pass
-            self._ssl = 0
-            self._ctx = 0
-        self._tcp.close()
+            self._shutdown_graceful()
+        self._close_abortive()
 
     def _close_abortive(mut self):
         """Free TLS state without attempting ``SSL_shutdown``.
 
-        Internal owner loops use this after a fatal TLS result or an fd-level
-        shutdown. OpenSSL forbids calling ``SSL_shutdown`` after
-        ``SSL_ERROR_SSL`` or ``SSL_ERROR_SYSCALL``.
+        Internal owners use this after a separate graceful-shutdown attempt,
+        a fatal TLS result, or an fd-level shutdown. OpenSSL forbids calling
+        ``SSL_shutdown`` after ``SSL_ERROR_SSL`` or ``SSL_ERROR_SYSCALL``.
         """
         if self._ssl != 0:
             try:

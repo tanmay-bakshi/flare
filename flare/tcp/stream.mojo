@@ -90,6 +90,105 @@ def _do_flare_connect_timeout(
     return fn_ct(fd, sa_addr, sa_len, timeout_ms)
 
 
+struct _TcpConnectAttempt(Movable):
+    """Linear non-blocking TCP dial owned by an external reactor."""
+
+    var _socket: RawSocket
+    var _peer: SocketAddr
+    var _started: Bool
+    var _complete: Bool
+
+    def __init__(out self, var socket: RawSocket, peer: SocketAddr):
+        self._socket = socket^
+        self._peer = peer
+        self._started = False
+        self._complete = False
+
+    @staticmethod
+    def create(peer: SocketAddr) raises -> Self:
+        """Create and configure the fd before the caller publishes it."""
+        var family = AF_INET6 if peer.ip.is_v6() else AF_INET
+        var socket = RawSocket(family, SOCK_STREAM)
+        socket.set_nonblocking(True)
+        return Self(socket^, peer)
+
+    def fd(self) -> c_int:
+        return self._socket.fd
+
+    def close(mut self):
+        """Close the owner-held fd without transferring the attempt."""
+        self._socket.close()
+
+    def start(mut self) raises -> Bool:
+        """Initiate the dial and report whether it completed immediately."""
+        if self._started:
+            raise NetworkError("TCP connect attempt already started")
+        self._started = True
+        var sockaddr = _build_sockaddr_in(self._peer)
+        var rc = _connect(self._socket.fd, sockaddr[0], sockaddr[1])
+        var error = get_errno()
+        sockaddr[0].unsafe_free()
+        if rc == c_int(0):
+            self._complete = True
+            return True
+        if error == ErrNo.EINPROGRESS:
+            return False
+        self._raise_connect_error(error.value)
+        return False
+
+    def complete_ready(mut self) raises:
+        """Validate the writable edge through ``SO_ERROR``."""
+        if not self._started:
+            raise NetworkError("TCP connect attempt was not started")
+        if self._complete:
+            return
+        var socket_error = stack_allocation[1, c_int]()
+        socket_error.unsafe_write(c_int(0))
+        var size = stack_allocation[1, c_uint]()
+        size.unsafe_write(c_uint(4))
+        var rc = _getsockopt(
+            self._socket.fd,
+            SOL_SOCKET,
+            SO_ERROR,
+            socket_error.unsafe_bitcast[UInt8](),
+            size,
+        )
+        if rc < c_int(0):
+            var error = get_errno()
+            raise NetworkError(
+                _strerror(error.value) + " (getsockopt SO_ERROR)",
+                Int(error.value),
+            )
+        var result = socket_error.unsafe_load()
+        if result != c_int(0):
+            self._raise_connect_error(result)
+        self._complete = True
+
+    def prepare_finish(mut self) raises:
+        """Complete every fallible operation before ownership transfer."""
+        if not self._complete:
+            raise NetworkError("TCP connect attempt is not complete")
+        self._socket.set_tcp_nodelay(True)
+
+    def finish(deinit self) -> TcpStream:
+        """Transfer a prepared, still-nonblocking socket into a stream."""
+        var socket = self._socket^
+        return TcpStream(socket^, self._peer)
+
+    def _raise_connect_error(self, error: c_int) raises:
+        var peer = String(self._peer)
+        if Int(error) == Int(ErrNo.ECONNREFUSED.value):
+            raise ConnectionRefused(peer, Int(error))
+        if Int(error) == Int(ErrNo.ETIMEDOUT.value):
+            raise ConnectionTimeout(peer, Int(error))
+        if Int(error) == Int(ErrNo.ECONNRESET.value):
+            raise ConnectionReset(peer, Int(error))
+        raise NetworkError(
+            _strerror(error) + " (connect " + peer + ")",
+            Int(error),
+        )
+
+
 struct TcpStream(Movable, Readable):
     """A connected TCP socket.
 

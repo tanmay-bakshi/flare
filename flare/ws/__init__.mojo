@@ -8,15 +8,17 @@ clean close handshake. SIMD-accelerated payload masking for payloads ≥128 byte
 
 ```mojo
 from flare.ws import (
-    WsClient, WsServer, WsDuplex,
+    WsClient, WsConnectAttempt, WsServer, WsDuplex,
     WsSender, WsReceiver, WsShutdown,
     WsFrame, WsOpcode, WsCloseCode,
     WsProtocolError, WsHandshakeError,
 )
 ```
 
-- `WsClient` — WebSocket client: `connect`, `send_text`, `send_binary`,
-  `recv`, `close`, and the consuming `split` operation.
+- `WsClient` — WebSocket client: `connect`, `connect_attempt`, `send_text`,
+  `send_binary`, `recv`, `close`, and the consuming `split` operation.
+- `WsConnectAttempt` — cancellable DNS-through-Upgrade attempt with an
+  absolute handshake deadline and a shutdown handle available before dialing.
 - `WsDuplex` — Linear carrier returned by `WsClient.split()` for one sender
   thread, one receiver thread, and an independent shutdown owner.
 - `WsServer` — WebSocket server: upgrades HTTP connections to WebSocket.
@@ -81,11 +83,27 @@ var shutdown = duplex.take_shutdown()
 # receiver thread continuously drives recv; shutdown may be retained by the
 # teardown owner to interrupt a blocked receive.
 ```
+
+### Cancellable opening handshake
+
+```mojo
+var attempt = WsClient.connect_attempt(
+    "wss://example.com/stream",
+    handshake_timeout_ms=5000,
+)
+var shutdown = attempt.take_shutdown()
+var client = attempt^.connect()
+```
+
+The shutdown handle exists before DNS begins and remains authoritative after
+the completed client is split. The timeout is one absolute DNS-through-Upgrade
+deadline, not a fresh budget for each phase.
 """
 
 from .frame import WsFrame, WsOpcode, WsCloseCode, WsProtocolError
 from .client import (
     WsClient,
+    WsConnectAttempt,
     WsHandshakeError,
     WsMessage,
     WsSender,

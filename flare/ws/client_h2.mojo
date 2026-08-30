@@ -39,6 +39,7 @@ from .frame import (
     WsCloseCode,
     WsProtocolError,
     _DecodeResult,
+    _encode_client_frame,
 )
 from ..http2.client import Http2ClientConnection
 from ..http2.hpack import HpackHeader
@@ -106,12 +107,9 @@ def bootstrap_ws_over_h2(
 struct WsOverH2Stream(Movable):
     """Stream-keyed adapter that turns an h2 stream into a WS tunnel.
 
-    Owns the per-stream receive buffer (DATA frames are appended,
-    WS frames are pulled out as they complete) and the outgoing
-    masking-key state (a deterministic monotonic counter is fine
-    here -- the over-the-wire mask is moot when h2 is itself
-    over TLS, but we still emit it so the adapter is symmetrical
-    with the h1 path).
+    Owns the per-stream receive buffer (DATA frames are appended and
+    WS frames are pulled out as they complete). Outgoing frames use the
+    same operating-system-backed masking encoder as the h1 client.
 
     Lifetime: one instance per Extended CONNECT stream. The
     adapter does *not* drive the underlying h2 connection; the
@@ -128,11 +126,6 @@ struct WsOverH2Stream(Movable):
     var read_buffer: List[UInt8]
     """Accumulated, undecoded receive bytes from
     :attr:`Stream.data`. Refilled on every :meth:`pull_frames`."""
-    var mask_counter: UInt32
-    """Monotonic counter used to derive a 4-byte masking key per
-    outbound frame; sufficient when TLS already protects the
-    wire. A future iteration will swap this for a CSPRNG-derived
-    key."""
     var closed: Bool
     """Set to ``True`` after a CLOSE frame is sent or received.
     Subsequent send/recv attempts raise."""
@@ -147,7 +140,6 @@ struct WsOverH2Stream(Movable):
         """
         self.stream_id = stream_id
         self.read_buffer = List[UInt8]()
-        self.mask_counter = 1
         self.closed = False
 
     # ── Send path ────────────────────────────────────────────────
@@ -158,10 +150,9 @@ struct WsOverH2Stream(Movable):
         """Encode ``frame`` and queue it as a DATA frame on this
         stream.
 
-        Per RFC 6455 §5.3 we mask the payload (mandatory on the
-        client side); the masking key is a 32-bit counter rotated
-        on every send. The ``end_stream`` flag is set IFF the
-        frame is a CLOSE frame, which mirrors RFC 8441 §5.5
+        Per RFC 6455 §5.3 we mask the payload with a fresh random
+        key (mandatory on the client side). The ``end_stream`` flag
+        is set IFF the frame is a CLOSE frame, which mirrors RFC 8441 §5.5
         ("close handshake completion translates to half-close").
 
         Args:
@@ -170,13 +161,7 @@ struct WsOverH2Stream(Movable):
         """
         if self.closed:
             raise Error("WsOverH2Stream: send on closed stream")
-        var k0 = UInt8((self.mask_counter >> 24) & 0xFF)
-        var k1 = UInt8((self.mask_counter >> 16) & 0xFF)
-        var k2 = UInt8((self.mask_counter >> 8) & 0xFF)
-        var k3 = UInt8(self.mask_counter & 0xFF)
-        self.mask_counter += 1
-        var key = SIMD[DType.uint8, 4](k0, k1, k2, k3)
-        var wire = frame.encode_with_key(True, key)
+        var wire = _encode_client_frame(frame)
         var end = frame.opcode == WsOpcode.CLOSE
         conn.send_data(self.stream_id, Span[UInt8, _](wire), end)
         if end:

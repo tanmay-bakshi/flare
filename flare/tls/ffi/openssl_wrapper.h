@@ -84,6 +84,40 @@ int flare_ssl_read_ex(flare_ssl_t ssl, uint8_t* buf, int len);
  */
 int flare_ssl_write_ex(flare_ssl_t ssl, const uint8_t* buf, int len);
 
+/* ── Owner-loop memory BIO bridge ────────────────────────────────────────── */
+
+/**
+ * Replace the connected socket BIOs after the handshake with independent
+ * memory BIOs. The SSL object owns both BIOs after this call. The caller owns
+ * the socket fd and must feed received ciphertext into the read BIO, drain
+ * produced ciphertext from the write BIO, and publish it through the fd.
+ *
+ * This transition is idempotent. Calling it after the memory BIOs are already
+ * installed preserves their buffered data.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int flare_ssl_enable_owner_bio(flare_ssl_t ssl);
+
+/**
+ * Append network ciphertext to the SSL object's read BIO.
+ *
+ * @return The complete byte count on success, or -1 on failure.
+ */
+int flare_ssl_feed_owner_ciphertext(
+    flare_ssl_t ssl, const uint8_t* buf, int len
+);
+
+/**
+ * Remove up to ``len`` bytes of ciphertext from the SSL object's write BIO.
+ *
+ * @return A positive byte count, 0 when no output is pending, or -1 on
+ *         failure.
+ */
+int flare_ssl_drain_owner_ciphertext(
+    flare_ssl_t ssl, uint8_t* buf, int len
+);
+
 /* ── Introspection ─────────────────────────────────────────────────────────── */
 
 const char* flare_ssl_get_version(flare_ssl_t ssl);

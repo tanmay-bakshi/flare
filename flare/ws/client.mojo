@@ -28,7 +28,7 @@ from ._duplex import (
 )
 from ._message import WsMessage
 from ._transport import _WsStream
-from .frame import WsFrame, WsOpcode
+from .frame import WsFrame, WsOpcode, _encode_client_frame
 from ..crypto.base64 import base64_encode as _base64_encode
 from ..http.url import Url
 from ..tls import TlsStream, TlsConfig
@@ -536,7 +536,7 @@ struct WsClient(Movable):
             NetworkError: On I/O failure.
         """
         var frame = WsFrame.text(msg)
-        var wire = frame.encode(mask=True)
+        var wire = _encode_client_frame(frame)
         self._stream.write_all(Span[UInt8, _](wire))
 
     def send_binary(self, data: List[UInt8]) raises:
@@ -549,7 +549,7 @@ struct WsClient(Movable):
             NetworkError: On I/O failure.
         """
         var frame = WsFrame.binary(data)
-        var wire = frame.encode(mask=True)
+        var wire = _encode_client_frame(frame)
         self._stream.write_all(Span[UInt8, _](wire))
 
     def send_frame(self, frame: WsFrame) raises:
@@ -561,7 +561,7 @@ struct WsClient(Movable):
         Raises:
             NetworkError: On I/O failure.
         """
-        var wire = frame.encode(mask=True)
+        var wire = _encode_client_frame(frame)
         self._stream.write_all(Span[UInt8, _](wire))
 
     # ── Receiving ─────────────────────────────────────────────────────────────
@@ -585,7 +585,7 @@ struct WsClient(Movable):
             if frame.opcode == WsOpcode.PING:
                 # RFC 6455 §5.5.3: respond with PONG carrying same payload
                 var pong = WsFrame.pong(frame.payload)
-                var wire = pong.encode(mask=True)
+                var wire = _encode_client_frame(pong)
                 self._stream.write_all(Span[UInt8, _](wire))
                 continue
             return frame^
@@ -669,7 +669,7 @@ struct WsClient(Movable):
         """
         try:
             var close_frame = WsFrame.close()
-            var wire = close_frame.encode(mask=True)
+            var wire = _encode_client_frame(close_frame)
             self._stream.write_all(Span[UInt8, _](wire))
         except:
             pass  # best-effort

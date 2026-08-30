@@ -49,6 +49,16 @@ comptime _SENDER_PENDING: UInt8 = UInt8(0)
 comptime _SENDER_WAITING: UInt8 = UInt8(1)
 comptime _SENDER_SUCCEEDED: UInt8 = UInt8(2)
 comptime _SENDER_FAILED: UInt8 = UInt8(3)
+comptime _PRESSURE_RECEIVER_PENDING: UInt8 = UInt8(0)
+comptime _PRESSURE_RECEIVER_INBOUND: UInt8 = UInt8(1)
+comptime _PRESSURE_RECEIVER_VALIDATED: UInt8 = UInt8(2)
+comptime _PRESSURE_RECEIVER_FAILED: UInt8 = UInt8(3)
+comptime _PRESSURE_PAYLOAD_BYTES: Int = 4 * 1024 * 1024
+comptime _PRESSURE_SOCKET_BUFFER_BYTES: Int = 4 * 1024
+comptime _PRESSURE_DEADLINE_MS: Int = 10_000
+comptime _PRESSURE_SERVER_HOLD_US: Int = 250_000
+comptime _SERVER_PRESSURE_SALT: Int = 17
+comptime _CLIENT_PRESSURE_SALT: Int = 83
 
 
 def _null_opaque_pointer() -> _OpaquePtr:
@@ -60,6 +70,29 @@ def _is_retry(result: Int) -> Bool:
     return result == SSL_IO_WANT_READ or result == SSL_IO_WANT_WRITE
 
 
+def _make_pressure_payload(size: Int, salt: Int) -> List[UInt8]:
+    var payload = List[UInt8](capacity=size)
+    for index in range(size):
+        payload.append(UInt8((index * 31 + salt) % 251))
+    return payload^
+
+
+def _validate_pressure_payload(
+    payload: List[UInt8], expected_size: Int, salt: Int
+) raises:
+    if len(payload) != expected_size:
+        raise Error(
+            "pressure payload length mismatch: got "
+            + String(len(payload))
+            + ", expected "
+            + String(expected_size)
+        )
+    for index in range(expected_size):
+        var expected = UInt8((index * 31 + salt) % 251)
+        if payload[index] != expected:
+            raise Error("pressure payload mismatch at byte " + String(index))
+
+
 struct _TlsWebSocketPeer(Movable):
     """Scriptable server-side TLS connection with buffered frame reads."""
 
@@ -68,8 +101,13 @@ struct _TlsWebSocketPeer(Movable):
     var _ssl_address: Int
     var _input: List[UInt8]
 
-    def __init__(out self, listener: TcpListener) raises:
+    def __init__(
+        out self, listener: TcpListener, constrain_buffers: Bool = False
+    ) raises:
         var stream: TcpStream = listener.accept()
+        if constrain_buffers:
+            stream._socket.set_send_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
+            stream._socket.set_recv_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
         var context: ServerCtx = ServerCtx.new(_SERVER_CERTIFICATE, _SERVER_KEY)
         var ssl_address: Int = server_ssl_new_accept(
             context, Int(stream._socket.fd)
@@ -128,8 +166,7 @@ struct _TlsWebSocketPeer(Movable):
                 continue
             raise Error("TLS write failed with result: " + String(result))
 
-    def accept_upgrade(mut self) raises:
-        """Read the client's HTTP Upgrade and emit a valid 101 response."""
+    def _read_upgrade_response(mut self) raises -> String:
         while True:
             for index in range(len(self._input) - 3):
                 if (
@@ -150,10 +187,25 @@ struct _TlsWebSocketPeer(Movable):
                         + accept
                         + "\r\n\r\n"
                     )
-                    self._write_all(response.as_bytes())
                     self._input.clear()
-                    return
+                    return response^
             self._read_more()
+
+    def accept_upgrade(mut self) raises:
+        """Read the client's HTTP Upgrade and emit a valid 101 response."""
+        var response = self._read_upgrade_response()
+        self._write_all(response.as_bytes())
+
+    def accept_upgrade_with_frame(mut self, frame: WsFrame) raises:
+        """Emit HTTP 101 and the first frame in one TLS plaintext write."""
+        var response = self._read_upgrade_response()
+        var wire = frame.encode(mask=False)
+        var combined = List[UInt8](capacity=response.byte_length() + len(wire))
+        for byte in response.as_bytes():
+            combined.append(byte)
+        for byte in wire:
+            combined.append(byte)
+        self._write_all(Span[UInt8, _](combined))
 
     def recv_frame(mut self) raises -> WsFrame:
         """Read and remove one complete client frame."""
@@ -205,8 +257,13 @@ struct _PlainWebSocketPeer(Movable):
     var _stream: TcpStream
     var _input: List[UInt8]
 
-    def __init__(out self, listener: TcpListener) raises:
+    def __init__(
+        out self, listener: TcpListener, constrain_buffers: Bool = False
+    ) raises:
         self._stream = listener.accept()
+        if constrain_buffers:
+            self._stream._socket.set_send_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
+            self._stream._socket.set_recv_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
         self._input = List[UInt8]()
 
     def _read_more(mut self) raises:
@@ -327,6 +384,48 @@ def _run_terminal_server(listener: TcpListener) raises:
     usleep(5_000_000)
 
 
+def _run_coalesced_upgrade_server(listener: TcpListener) raises:
+    var peer = _TlsWebSocketPeer(listener)
+    peer.accept_upgrade_with_frame(WsFrame.text("coalesced-upgrade-frame"))
+    usleep(5_000_000)
+
+
+def _run_tls_pressure_server(listener: TcpListener) raises:
+    var peer = _TlsWebSocketPeer(listener, constrain_buffers=True)
+    peer.accept_upgrade()
+    usleep(50_000)
+    var payload = _make_pressure_payload(
+        _PRESSURE_PAYLOAD_BYTES, _SERVER_PRESSURE_SALT
+    )
+    peer.send_frame(WsFrame.binary(payload))
+    usleep(_PRESSURE_SERVER_HOLD_US)
+    var inbound = peer.recv_frame()
+    if inbound.opcode != WsOpcode.BINARY:
+        raise Error("TLS pressure peer expected one binary frame")
+    _validate_pressure_payload(
+        inbound.payload, _PRESSURE_PAYLOAD_BYTES, _CLIENT_PRESSURE_SALT
+    )
+    peer.send_frame(WsFrame.text("tls-pressure-validated"))
+
+
+def _run_plain_pressure_server(listener: TcpListener) raises:
+    var peer = _PlainWebSocketPeer(listener, constrain_buffers=True)
+    peer.accept_upgrade()
+    usleep(50_000)
+    var payload = _make_pressure_payload(
+        _PRESSURE_PAYLOAD_BYTES, _SERVER_PRESSURE_SALT
+    )
+    peer.send_frame(WsFrame.binary(payload))
+    usleep(_PRESSURE_SERVER_HOLD_US)
+    var inbound = peer.recv_frame()
+    if inbound.opcode != WsOpcode.BINARY:
+        raise Error("plain pressure peer expected one binary frame")
+    _validate_pressure_payload(
+        inbound.payload, _PRESSURE_PAYLOAD_BYTES, _CLIENT_PRESSURE_SALT
+    )
+    peer.send_frame(WsFrame.text("plain-pressure-validated"))
+
+
 def _spawn_server(listener: TcpListener) -> Int:
     var process_id: Int = fork()
     if process_id == 0:
@@ -349,6 +448,28 @@ def _spawn_terminal_server(listener: TcpListener) -> Int:
     return process_id
 
 
+def _spawn_coalesced_upgrade_server(listener: TcpListener) -> Int:
+    var process_id: Int = fork()
+    if process_id == 0:
+        try:
+            _run_coalesced_upgrade_server(listener)
+            exit(0)
+        except:
+            exit(1)
+    return process_id
+
+
+def _spawn_tls_pressure_server(listener: TcpListener) -> Int:
+    var process_id: Int = fork()
+    if process_id == 0:
+        try:
+            _run_tls_pressure_server(listener)
+            exit(0)
+        except:
+            exit(1)
+    return process_id
+
+
 def _run_plain_server(listener: TcpListener) raises:
     """Echo one text frame and keep the peer open until client shutdown."""
     var peer = _PlainWebSocketPeer(listener)
@@ -365,6 +486,17 @@ def _spawn_plain_server(listener: TcpListener) -> Int:
     if process_id == 0:
         try:
             _run_plain_server(listener)
+            exit(0)
+        except:
+            exit(1)
+    return process_id
+
+
+def _spawn_plain_pressure_server(listener: TcpListener) -> Int:
+    var process_id: Int = fork()
+    if process_id == 0:
+        try:
+            _run_plain_pressure_server(listener)
             exit(0)
         except:
             exit(1)
@@ -438,6 +570,38 @@ def _waiting_sender_thread(argument: _OpaquePtr) -> _OpaquePtr:
     return _null_opaque_pointer()
 
 
+struct _PressureSenderThreadContext(Movable):
+    """Large client frame and publication state owned by one sender thread."""
+
+    var sender: WsSender
+    var payload: List[UInt8]
+    var state_address: Int
+    var error_message: String
+
+    def __init__(
+        out self,
+        var sender: WsSender,
+        var payload: List[UInt8],
+        state_address: Int,
+    ):
+        self.sender = sender^
+        self.payload = payload^
+        self.state_address = state_address
+        self.error_message = ""
+
+
+def _pressure_sender_thread(argument: _OpaquePtr) -> _OpaquePtr:
+    var context = argument.unsafe_bitcast[_PressureSenderThreadContext]()
+    _store_state(context[].state_address, _SENDER_WAITING)
+    try:
+        context[].sender.send_binary(context[].payload)
+        _store_state(context[].state_address, _SENDER_SUCCEEDED)
+    except error:
+        context[].error_message = String(error)
+        _store_state(context[].state_address, _SENDER_FAILED)
+    return _null_opaque_pointer()
+
+
 def _store_state(address: Int, state: UInt8):
     var pointer = UnsafePointer[UInt8, MutUntrackedOrigin](
         unsafe_from_address=address
@@ -450,6 +614,60 @@ def _load_state(address: Int) -> UInt8:
         unsafe_from_address=address
     ).unsafe_bitcast[Scalar[DType.uint8]]()
     return Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](pointer)
+
+
+struct _PressureReceiverThreadContext(Movable):
+    """Large server frame, validation ack, and publication-fence evidence."""
+
+    var receiver: WsReceiver
+    var state_address: Int
+    var sender_state_address: Int
+    var validation_text: String
+    var sender_waited_after_inbound: Bool
+    var error_message: String
+
+    def __init__(
+        out self,
+        var receiver: WsReceiver,
+        state_address: Int,
+        sender_state_address: Int,
+        validation_text: String,
+    ):
+        self.receiver = receiver^
+        self.state_address = state_address
+        self.sender_state_address = sender_state_address
+        self.validation_text = validation_text
+        self.sender_waited_after_inbound = False
+        self.error_message = ""
+
+
+def _pressure_receiver_thread(argument: _OpaquePtr) -> _OpaquePtr:
+    var context = argument.unsafe_bitcast[_PressureReceiverThreadContext]()
+    try:
+        var inbound = context[].receiver.recv()
+        if inbound.opcode != WsOpcode.BINARY:
+            raise Error("pressure receiver expected one binary frame")
+        context[].sender_waited_after_inbound = (
+            _load_state(context[].sender_state_address) == _SENDER_WAITING
+        )
+        _validate_pressure_payload(
+            inbound.payload,
+            _PRESSURE_PAYLOAD_BYTES,
+            _SERVER_PRESSURE_SALT,
+        )
+        _store_state(context[].state_address, _PRESSURE_RECEIVER_INBOUND)
+
+        var validation = context[].receiver.recv()
+        if (
+            validation.opcode != WsOpcode.TEXT
+            or validation.text_payload() != context[].validation_text
+        ):
+            raise Error("pressure peer validation acknowledgment mismatch")
+        _store_state(context[].state_address, _PRESSURE_RECEIVER_VALIDATED)
+    except error:
+        context[].error_message = String(error)
+        _store_state(context[].state_address, _PRESSURE_RECEIVER_FAILED)
+    return _null_opaque_pointer()
 
 
 struct _ReceiverThreadContext(Movable):
@@ -537,6 +755,107 @@ def _plain_receiver_thread(argument: _OpaquePtr) -> _OpaquePtr:
         context[].error_message = String(error)
         _store_state(context[].state_address, _RECEIVER_FAILED)
     return _null_opaque_pointer()
+
+
+def _exercise_pressure_connection(
+    var client: WsClient, process_id: Int, validation_text: String
+) raises:
+    var duplex = client^.split()
+    var sender: WsSender = duplex.take_sender()
+    var receiver: WsReceiver = duplex.take_receiver()
+    var shutdown: WsShutdown = duplex.take_shutdown()
+
+    var sender_state = unsafe_alloc[UInt8](1)
+    sender_state.unsafe_write(_SENDER_PENDING)
+    var receiver_state = unsafe_alloc[UInt8](1)
+    receiver_state.unsafe_write(_PRESSURE_RECEIVER_PENDING)
+    var payload = _make_pressure_payload(
+        _PRESSURE_PAYLOAD_BYTES, _CLIENT_PRESSURE_SALT
+    )
+    var sender_context = unsafe_alloc[_PressureSenderThreadContext](1)
+    sender_context.unsafe_write(
+        _PressureSenderThreadContext(sender^, payload^, Int(sender_state))
+    )
+    var receiver_context = unsafe_alloc[_PressureReceiverThreadContext](1)
+    receiver_context.unsafe_write(
+        _PressureReceiverThreadContext(
+            receiver^,
+            Int(receiver_state),
+            Int(sender_state),
+            validation_text,
+        )
+    )
+
+    var sender_argument = _OpaquePtr(unsafe_from_address=Int(sender_context))
+    var sender_thread: ThreadHandle = ThreadHandle.spawn[
+        _pressure_sender_thread
+    ](sender_argument)
+    var sender_start_deadline = monotonic_now_ms() + 2_000
+    while (
+        _load_state(Int(sender_state)) == _SENDER_PENDING
+        and monotonic_now_ms() < sender_start_deadline
+    ):
+        usleep(1_000)
+
+    var receiver_argument = _OpaquePtr(
+        unsafe_from_address=Int(receiver_context)
+    )
+    var receiver_thread: ThreadHandle = ThreadHandle.spawn[
+        _pressure_receiver_thread
+    ](receiver_argument)
+
+    var deadline = monotonic_now_ms() + _PRESSURE_DEADLINE_MS
+    var observed_receiver_state = _load_state(Int(receiver_state))
+    var observed_sender_state = _load_state(Int(sender_state))
+    while monotonic_now_ms() < deadline:
+        if (
+            observed_receiver_state == _PRESSURE_RECEIVER_FAILED
+            or observed_sender_state == _SENDER_FAILED
+        ):
+            break
+        if (
+            observed_receiver_state == _PRESSURE_RECEIVER_VALIDATED
+            and observed_sender_state == _SENDER_SUCCEEDED
+        ):
+            break
+        usleep(1_000)
+        observed_receiver_state = _load_state(Int(receiver_state))
+        observed_sender_state = _load_state(Int(sender_state))
+
+    shutdown.shutdown()
+    shutdown.shutdown()
+    _stop_server(process_id)
+    receiver_thread.join()
+    sender_thread.join()
+
+    observed_receiver_state = _load_state(Int(receiver_state))
+    observed_sender_state = _load_state(Int(sender_state))
+    var sender_error_message = sender_context[].error_message.copy()
+    var receiver_error_message = receiver_context[].error_message.copy()
+    var sender_waited_after_inbound = (
+        receiver_context[].sender_waited_after_inbound
+    )
+    sender_context.unsafe_deinit_pointee()
+    sender_context.unsafe_free()
+    receiver_context.unsafe_deinit_pointee()
+    receiver_context.unsafe_free()
+    sender_state.unsafe_free()
+    receiver_state.unsafe_free()
+
+    assert_equal(
+        observed_receiver_state,
+        _PRESSURE_RECEIVER_VALIDATED,
+        "pressure receive failed or timed out: " + receiver_error_message,
+    )
+    assert_equal(
+        observed_sender_state,
+        _SENDER_SUCCEEDED,
+        "pressure send failed or timed out: " + sender_error_message,
+    )
+    assert_true(
+        sender_waited_after_inbound,
+        "sender returned before the peer read its multi-megabyte frame",
+    )
 
 
 def test_public_split_over_wss_is_full_duplex_and_shutdown_safe() raises:
@@ -839,9 +1158,60 @@ def test_public_split_over_plain_ws_is_full_duplex() raises:
     assert_true(receiver_interrupted)
 
 
+def test_wss_split_preserves_frame_coalesced_with_upgrade() raises:
+    """Keep post-upgrade plaintext buffered inside SSL across the split."""
+    var listener: TcpListener = TcpListener.bind(SocketAddr.localhost(0))
+    var port: UInt16 = listener.local_addr().port
+    var process_id: Int = _spawn_coalesced_upgrade_server(listener)
+
+    var client: WsClient = _connect(port)
+    var duplex = client^.split()
+    var receiver: WsReceiver = duplex.take_receiver()
+    var shutdown: WsShutdown = duplex.take_shutdown()
+    var sender: WsSender = duplex.take_sender()
+    var frame = receiver.recv()
+    shutdown.shutdown()
+    shutdown.shutdown()
+    _stop_server(process_id)
+
+    assert_equal(frame.opcode, WsOpcode.TEXT)
+    assert_equal(frame.text_payload(), "coalesced-upgrade-frame")
+
+
+def test_wss_split_survives_simultaneous_multimegabyte_backpressure() raises:
+    """Drain inbound TLS while an independently published send is blocked."""
+    var listener: TcpListener = TcpListener.bind(SocketAddr.localhost(0))
+    var port: UInt16 = listener.local_addr().port
+    var process_id: Int = _spawn_tls_pressure_server(listener)
+    var client: WsClient = _connect(port)
+    client._stream._tls._tcp._socket.set_send_buffer(
+        _PRESSURE_SOCKET_BUFFER_BYTES
+    )
+    client._stream._tls._tcp._socket.set_recv_buffer(
+        _PRESSURE_SOCKET_BUFFER_BYTES
+    )
+    _exercise_pressure_connection(client^, process_id, "tls-pressure-validated")
+
+
+def test_plain_split_survives_simultaneous_multimegabyte_backpressure() raises:
+    """Drain inbound TCP while an independently published send is blocked."""
+    var listener: TcpListener = TcpListener.bind(SocketAddr.localhost(0))
+    var port: UInt16 = listener.local_addr().port
+    var process_id: Int = _spawn_plain_pressure_server(listener)
+    var client: WsClient = _connect_plain(port)
+    client._stream._tcp._socket.set_send_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
+    client._stream._tcp._socket.set_recv_buffer(_PRESSURE_SOCKET_BUFFER_BYTES)
+    _exercise_pressure_connection(
+        client^, process_id, "plain-pressure-validated"
+    )
+
+
 def main() raises:
     test_public_split_over_wss_is_full_duplex_and_shutdown_safe()
     test_shutdown_releases_sender_waiting_for_publication()
     test_peer_close_releases_sender_without_publishing_later_frame()
     test_public_split_over_plain_ws_is_full_duplex()
+    test_wss_split_preserves_frame_coalesced_with_upgrade()
+    test_wss_split_survives_simultaneous_multimegabyte_backpressure()
+    test_plain_split_survives_simultaneous_multimegabyte_backpressure()
     print("test_ws_duplex_wss: OK")

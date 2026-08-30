@@ -25,6 +25,7 @@ Masking (§5.3):
     This implementation uses SIMD-32 masking for payloads ≥ 64 bytes.
 """
 
+from std.ffi import c_int, c_size_t, external_call
 from std.format import Writable, Writer
 from std.memory import UnsafePointer
 
@@ -120,7 +121,7 @@ struct WsFrame(Movable, Writable):
     Example:
         ```mojo
         var frame = WsFrame.text("hello")
-        var wire = frame.encode(mask=True) # client sending to server
+        var wire = frame.encode(mask=True) # deterministic masked test fixture
         ```
     """
 
@@ -222,12 +223,10 @@ struct WsFrame(Movable, Writable):
         """Encode this frame to its RFC 6455 wire representation.
 
         Masking is applied with a deterministic all-zero key when ``mask=True``
-        in test builds; production code should pass a cryptographically random
-        4-byte key via ``encode_with_key``.
+        for test fixtures. Production clients use ``_encode_client_frame``.
 
         Args:
-            mask: True to apply a zero mask key (for testing; use
-                  ``encode_with_key`` for real client→server frames).
+            mask: True to apply a zero mask key for testing.
 
         Returns:
             The complete frame bytes ready to write to the socket.
@@ -236,17 +235,6 @@ struct WsFrame(Movable, Writable):
             WsProtocolError: If ``rsv1`` is set without a negotiated extension,
                              or if a control frame payload exceeds 125 bytes.
         """
-        if self.rsv1:
-            raise WsProtocolError(
-                "RSV1 bit requires an extension negotiation (e.g. per-message"
-                " deflate)"
-            )
-        if self.is_control() and len(self.payload) > 125:
-            raise WsProtocolError(
-                "Control frame payload must be ≤ 125 bytes (got "
-                + String(len(self.payload))
-                + ")"
-            )
         var key = SIMD[DType.uint8, 4](0, 0, 0, 0)
         return self.encode_with_key(mask, key)
 
@@ -263,8 +251,20 @@ struct WsFrame(Movable, Writable):
             The complete frame bytes.
 
         Raises:
-            WsProtocolError: If a control frame payload exceeds 125 bytes.
+            WsProtocolError: If ``rsv1`` is set without a negotiated extension,
+                             or if a control frame payload exceeds 125 bytes.
         """
+        if self.rsv1:
+            raise WsProtocolError(
+                "RSV1 bit requires an extension negotiation (e.g. per-message"
+                " deflate)"
+            )
+        if self.is_control() and len(self.payload) > 125:
+            raise WsProtocolError(
+                "Control frame payload must be ≤ 125 bytes (got "
+                + String(len(self.payload))
+                + ")"
+            )
         var plen = len(self.payload)
 
         # ── Header byte 0: FIN | RSV1 | RSV2 | RSV3 | opcode ─────────────────
@@ -610,3 +610,32 @@ def _append_masked(
     while i < n:
         out.append(src[i] ^ key[i & 3])
         i += 1
+
+
+# ── Production client encoding ──────────────────────────────────────────────────
+
+
+def _encode_client_frame(frame: WsFrame) raises -> List[UInt8]:
+    """Encode one production client frame with a fresh masking key.
+
+    RFC 6455 section 5.3 requires every client frame to use a fresh,
+    unpredictable 32-bit key. ``getentropy`` supplies the key directly from
+    the operating system; failure aborts the send before any bytes are written.
+
+    Args:
+        frame: The frame to encode.
+
+    Returns:
+        A complete, masked RFC 6455 frame.
+    """
+    var key_bytes = List[UInt8](capacity=4)
+    key_bytes.resize(4, 0)
+    var rc = external_call["getentropy", c_int](
+        key_bytes.unsafe_ptr(), c_size_t(4)
+    )
+    if rc != 0:
+        raise Error("getentropy failed while generating WebSocket mask")
+    var key = SIMD[DType.uint8, 4](
+        key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3]
+    )
+    return frame.encode_with_key(True, key)

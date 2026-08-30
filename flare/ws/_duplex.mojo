@@ -9,7 +9,7 @@ from std.os import abort
 
 from ._message import WsMessage
 from ._transport import _WsStream
-from .frame import WsFrame, WsOpcode
+from .frame import WsFrame, WsOpcode, _encode_client_frame
 from ..net import NetworkError
 from ..net._libc import _shutdown, SHUT_RDWR
 from ..runtime.event import Event, INTEREST_READ, INTEREST_WRITE
@@ -23,6 +23,7 @@ from ..tls.stream import (
 
 comptime _DUPLEX_SYNC_BYTES: Int = 128
 comptime _DUPLEX_SYNC_ALIGNMENT: Int = 16
+comptime _OUTBOUND_PLAINTEXT_CHUNK: Int = 16 * 1024
 comptime _WS_STREAM_TOKEN: UInt64 = 1
 comptime _SyncPointer = Pointer[UInt8, MutUntrackedOrigin]
 
@@ -312,7 +313,7 @@ struct WsSender(Movable):
 
     def send_frame(mut self, frame: WsFrame) raises:
         """Send one frame through the receiver-owned stream."""
-        var wire = frame.encode(mask=True)
+        var wire = _encode_client_frame(frame)
         self._shared[].send(wire^)
 
 
@@ -428,11 +429,15 @@ struct WsReceiver(Movable):
 
     def _write_once(mut self) raises -> Int:
         var remaining = len(self._out_wire) - self._out_offset
+        var chunk_size = (
+            remaining if remaining
+            < _OUTBOUND_PLAINTEXT_CHUNK else _OUTBOUND_PLAINTEXT_CHUNK
+        )
         var bytes = Span[UInt8, _](
             unsafe_ptr=self._out_wire.unsafe_ptr().unsafe_offset(
                 self._out_offset
             ),
-            length=remaining,
+            length=chunk_size,
         )
         var written: Int = 0
         try:
@@ -468,6 +473,22 @@ struct WsReceiver(Movable):
         except error:
             self._fail(String(error))
 
+    def _read_poll_interest(self, result: Int) -> Int:
+        var interest = (
+            INTEREST_WRITE if result == _SSL_IO_WANT_WRITE else INTEREST_READ
+        )
+        if self._shared[].stream.has_pending_network_output():
+            interest |= INTEREST_WRITE
+        return interest
+
+    def _write_poll_interest(self) -> Int:
+        var interest = self._write_retry_interest
+        if not self._shared[].stream.write_blocks_receive():
+            interest |= INTEREST_READ
+        if self._shared[].stream.has_pending_network_output():
+            interest |= INTEREST_WRITE
+        return interest
+
     def _drive_receive_once(mut self) raises:
         """Make one fair read or write step while waiting for a frame."""
         while True:
@@ -478,17 +499,23 @@ struct WsReceiver(Movable):
                 if received > 0:
                     self._service_one_outbound_step()
                     return
-                self._poll(
-                    INTEREST_WRITE if received
-                    == _SSL_IO_WANT_WRITE else INTEREST_READ
-                )
-                continue
+                if self._read_retry_want_write:
+                    self._poll(self._read_poll_interest(received))
+                    continue
 
             if self._out_command_id != 0:
+                if not self._shared[].stream.write_blocks_receive():
+                    var received = self._read_once()
+                    if received > 0:
+                        self._service_one_outbound_step()
+                        return
+                    if received == _SSL_IO_WANT_WRITE:
+                        self._poll(self._read_poll_interest(received))
+                        continue
                 var written = self._write_once()
                 if written > 0:
                     return
-                self._poll(self._write_retry_interest)
+                self._poll(self._write_poll_interest())
                 continue
 
             var received = self._read_once()
@@ -496,7 +523,7 @@ struct WsReceiver(Movable):
                 self._service_one_outbound_step()
                 return
             if received == _SSL_IO_WANT_WRITE:
-                self._poll(INTEREST_WRITE)
+                self._poll(self._read_poll_interest(received))
                 continue
 
             self._load_outbound(True)
@@ -504,10 +531,10 @@ struct WsReceiver(Movable):
                 var written = self._write_once()
                 if written > 0:
                     return
-                self._poll(self._write_retry_interest)
+                self._poll(self._write_poll_interest())
                 continue
 
-            self._poll(INTEREST_READ)
+            self._poll(self._read_poll_interest(received))
 
     def _drive_outbound_once(mut self, include_application: Bool) raises:
         """Advance one selected frame without admitting later commands."""
@@ -516,21 +543,22 @@ struct WsReceiver(Movable):
 
             if self._read_retry_want_write:
                 var received = self._read_once()
-                if received > 0:
-                    return
-                self._poll(
-                    INTEREST_WRITE if received
-                    == _SSL_IO_WANT_WRITE else INTEREST_READ
-                )
-                continue
+                if received <= 0 and self._read_retry_want_write:
+                    self._poll(self._read_poll_interest(received))
+                    continue
 
             self._load_outbound(include_application)
             if self._out_command_id == 0:
                 return
+            if not self._shared[].stream.write_blocks_receive():
+                var received = self._read_once()
+                if received == _SSL_IO_WANT_WRITE:
+                    self._poll(self._read_poll_interest(received))
+                    continue
             var written = self._write_once()
             if written > 0:
                 return
-            self._poll(self._write_retry_interest)
+            self._poll(self._write_poll_interest())
 
     def _service_one_outbound_step(mut self) raises:
         """Give one sender frame bounded progress before returning a frame."""
@@ -581,7 +609,7 @@ struct WsReceiver(Movable):
             var frame = decoded.take()
             if frame.opcode == WsOpcode.PING:
                 var pong = WsFrame.pong(frame.payload)
-                self._control_wire = pong.encode(mask=True)
+                self._control_wire = _encode_client_frame(pong)
                 self._control_pending = True
                 self._flush_control()
                 continue

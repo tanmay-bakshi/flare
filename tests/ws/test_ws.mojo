@@ -28,6 +28,7 @@ from flare.ws import (
     WsServer,
     WsConnection,
 )
+from flare.ws.frame import _encode_client_frame
 from flare.tcp import TcpStream, TcpListener
 from flare.net import SocketAddr
 from flare.tls import TlsConfig
@@ -167,6 +168,42 @@ def test_encode_with_zero_mask() raises:
     assert_equal(len(wire), 8)
     # Byte 1: MASK bit (0x80) | len=2
     assert_equal(Int(wire[1]), 0x80 | 2)
+    assert_equal(Int(wire[2]), 0)
+    assert_equal(Int(wire[3]), 0)
+    assert_equal(Int(wire[4]), 0)
+    assert_equal(Int(wire[5]), 0)
+    assert_equal(Int(wire[6]), ord("h"))
+    assert_equal(Int(wire[7]), ord("i"))
+
+
+def test_production_client_encoder_masks_with_wire_key() raises:
+    """The production encoder must mask payload bytes with its emitted key."""
+    var frame = WsFrame.text("mask")
+    var wire = _encode_client_frame(frame)
+    assert_equal(Int(wire[1]), 0x80 | 4)
+    for i in range(4):
+        assert_equal(Int(wire[6 + i]), Int(frame.payload[i] ^ wire[2 + i]))
+    var decoded = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_true(decoded.frame.masked)
+    assert_equal(decoded.frame.text_payload(), "mask")
+
+
+def test_production_client_encoder_uses_fresh_keys() raises:
+    """Separate production frames must not reuse a masking key."""
+    var frame = WsFrame.text("fresh")
+    var first = _encode_client_frame(frame)
+    var found_different = False
+    for _ in range(8):
+        var wire = _encode_client_frame(frame)
+        if (
+            wire[2] != first[2]
+            or wire[3] != first[3]
+            or wire[4] != first[4]
+            or wire[5] != first[5]
+        ):
+            found_different = True
+            break
+    assert_true(found_different, "getentropy masking key was reused")
 
 
 def test_encode_rsv1_raises() raises:

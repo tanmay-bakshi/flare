@@ -9,6 +9,7 @@
  */
 
 #include "openssl_wrapper.h"
+#include <openssl/bio.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
@@ -222,6 +223,99 @@ int flare_ssl_write_ex(flare_ssl_t ssl, const uint8_t* buf, int len) {
     int n = SSL_write(s, buf, len);
     if (n > 0) return n;
     return flare_ssl_io_classify(s, n);
+}
+
+// ── Owner-loop memory BIO bridge ────────────────────────────────────────────
+
+int flare_ssl_enable_owner_bio(flare_ssl_t ssl) {
+    ERR_clear_error();
+    if (!ssl) {
+        set_error("cannot enable owner BIOs on a null SSL session");
+        return -1;
+    }
+
+    SSL* s = static_cast<SSL*>(ssl);
+    BIO* current_rbio = SSL_get_rbio(s);
+    BIO* current_wbio = SSL_get_wbio(s);
+    if (current_rbio && current_wbio
+            && BIO_method_type(current_rbio) == BIO_TYPE_MEM
+            && BIO_method_type(current_wbio) == BIO_TYPE_MEM) {
+        return 0;
+    }
+
+    BIO* rbio = BIO_new(BIO_s_mem());
+    if (!rbio) {
+        capture_openssl_errors();
+        return -1;
+    }
+    BIO* wbio = BIO_new(BIO_s_mem());
+    if (!wbio) {
+        capture_openssl_errors();
+        BIO_free(rbio);
+        return -1;
+    }
+
+    // An empty read BIO means "retry after feeding network bytes", not EOF.
+    BIO_set_mem_eof_return(rbio, -1);
+    SSL_set0_rbio(s, rbio);
+    SSL_set0_wbio(s, wbio);
+    return 0;
+}
+
+int flare_ssl_feed_owner_ciphertext(
+    flare_ssl_t ssl, const uint8_t* buf, int len
+) {
+    ERR_clear_error();
+    if (!ssl || !buf || len < 0) {
+        set_error("invalid owner BIO ciphertext input");
+        return -1;
+    }
+    if (len == 0) return 0;
+
+    BIO* rbio = SSL_get_rbio(static_cast<SSL*>(ssl));
+    if (!rbio || BIO_method_type(rbio) != BIO_TYPE_MEM) {
+        set_error("SSL owner read BIO is not enabled");
+        return -1;
+    }
+
+    size_t written = 0;
+    if (BIO_write_ex(rbio, buf, static_cast<size_t>(len), &written) != 1
+            || written != static_cast<size_t>(len)) {
+        capture_openssl_errors();
+        if (last_error_msg.empty()) {
+            set_error("owner read BIO rejected ciphertext");
+        }
+        return -1;
+    }
+    return static_cast<int>(written);
+}
+
+int flare_ssl_drain_owner_ciphertext(
+    flare_ssl_t ssl, uint8_t* buf, int len
+) {
+    ERR_clear_error();
+    if (!ssl || !buf || len < 0) {
+        set_error("invalid owner BIO ciphertext output");
+        return -1;
+    }
+    if (len == 0) return 0;
+
+    BIO* wbio = SSL_get_wbio(static_cast<SSL*>(ssl));
+    if (!wbio || BIO_method_type(wbio) != BIO_TYPE_MEM) {
+        set_error("SSL owner write BIO is not enabled");
+        return -1;
+    }
+    if (BIO_ctrl_pending(wbio) == 0) return 0;
+
+    size_t read = 0;
+    if (BIO_read_ex(wbio, buf, static_cast<size_t>(len), &read) != 1) {
+        capture_openssl_errors();
+        if (last_error_msg.empty()) {
+            set_error("owner write BIO failed to release ciphertext");
+        }
+        return -1;
+    }
+    return static_cast<int>(read);
 }
 
 // ── Introspection ────────────────────────────────────────────────────────────

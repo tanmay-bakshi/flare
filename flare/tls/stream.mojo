@@ -258,6 +258,31 @@ def _do_ssl_write_ex(
     return Int(f(ssl, Int(data.unsafe_ptr()), c_int(len(data))))
 
 
+def _do_ssl_enable_owner_bio(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](
+        lib, "flare_ssl_enable_owner_bio"
+    )
+    return Int(f(ssl))
+
+
+def _do_ssl_feed_owner_ciphertext(
+    imm lib: OwnedDLHandle, ssl: Int, data: Span[UInt8, _]
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "flare_ssl_feed_owner_ciphertext"
+    )
+    return Int(f(ssl, Int(data.unsafe_ptr()), c_int(len(data))))
+
+
+def _do_ssl_drain_owner_ciphertext(
+    imm lib: OwnedDLHandle, ssl: Int, output: Int, max_bytes: Int
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "flare_ssl_drain_owner_ciphertext"
+    )
+    return Int(f(ssl, output, c_int(max_bytes)))
+
+
 def _do_ssl_shutdown(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
     var f = dl_sym[def(Int) thin abi("C") -> c_int](lib, "flare_ssl_shutdown")
     return Int(f(ssl))
@@ -817,6 +842,50 @@ struct TlsStream(Movable, Readable):
         if len(data) == 0:
             return 0
         return _do_ssl_write_ex(self._lib, self._ssl, data)
+
+    def _enable_owner_bio(self) raises:
+        """Detach TLS record processing from socket publication.
+
+        The SSL session retains its negotiated state while replacing the
+        connected socket BIOs with memory BIOs. The caller becomes responsible
+        for feeding received ciphertext and draining produced ciphertext on
+        the same owner thread.
+        """
+        if _do_ssl_enable_owner_bio(self._lib, self._ssl) != 0:
+            raise NetworkError(
+                "TLS owner BIO setup failed: " + _c_err(self._lib)
+            )
+
+    def _feed_owner_ciphertext(self, data: Span[UInt8, _]) raises -> Int:
+        """Append socket ciphertext to the owner loop's TLS read BIO."""
+        if len(data) == 0:
+            return 0
+        var written = _do_ssl_feed_owner_ciphertext(self._lib, self._ssl, data)
+        if written != len(data):
+            raise NetworkError(
+                "TLS owner BIO input failed: " + _c_err(self._lib)
+            )
+        return written
+
+    def _drain_owner_ciphertext(
+        self, mut output: List[UInt8], max_bytes: Int
+    ) raises -> Int:
+        """Append pending TLS write-BIO ciphertext to ``output``."""
+        if max_bytes <= 0:
+            return 0
+        var old_len = len(output)
+        output.resize(old_len + max_bytes, UInt8(0))
+        var destination = Int(output.unsafe_ptr().unsafe_offset(old_len))
+        var drained = _do_ssl_drain_owner_ciphertext(
+            self._lib, self._ssl, destination, max_bytes
+        )
+        if drained < 0:
+            output.resize(old_len, UInt8(0))
+            raise NetworkError(
+                "TLS owner BIO output failed: " + _c_err(self._lib)
+            )
+        output.resize(old_len + drained, UInt8(0))
+        return drained
 
     def read(mut self, buf: UnsafePointer[UInt8, _], size: Int) raises -> Int:
         """Decrypt and read up to ``size`` bytes into ``buf``.

@@ -96,7 +96,7 @@ opt-in.
 | `.with_proxy(url)` + `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` / `ALL_PROXY` env — routes requests through an HTTP proxy via a `CONNECT` tunnel (both `http://` and `https://`; TLS runs over the tunnel via `TlsStream.connect_over_tcp`) | [`tests/http/test_client_proxy.mojo`](../tests/http/test_client_proxy.mojo) |
 | Module-level helpers: `get`, `post`, `put`, `patch`, `delete`, `head` — `post` with `String` body sets `Content-Type: application/json` automatically | `flare.http.client` |
 | `Auth`, `BasicAuth(user, pass)`, `BearerAuth(token)` — both wires | `flare.http.auth` |
-| `Response.json()`, `.text()`, `.raise_for_status()`, `.ok()`, `.status` | `flare.http.response` |
+| `Response.text()`, `.raise_for_status()`, `.ok()`, `.status` | `flare.http.response` |
 
 ## Routing
 
@@ -132,7 +132,6 @@ Concrete typed extractors (`.value` is the parsed primitive):
 | `OptionalHeaderInt[name]` / `OptionalHeaderStr` / `OptionalHeaderFloat` / `OptionalHeaderBool` | optional header | [`extractors.mojo`](../examples/intermediate/extractors.mojo) |
 | `Peer` | client `SocketAddr` from accept path | `flare.http.extract` |
 | `BodyBytes` / `BodyText` | raw request body | `flare.http.extract` |
-| `Json[T]` | JSON-decoded body | `flare.http.extract` |
 | `Form[T]` | `application/x-www-form-urlencoded` body | [`forms.mojo`](../examples/intermediate/forms.mojo) |
 | `Multipart` | `multipart/form-data` body | [`multipart_upload.mojo`](../examples/intermediate/multipart_upload.mojo) |
 | `Cookies` | inbound `Cookie:` header → `CookieJar` | [`request_cookies.mojo`](../examples/intermediate/request_cookies.mojo) |
@@ -421,6 +420,7 @@ Router erases the handler type at registration).
 | Surface | Where |
 |---|---|
 | `WsClient.connect(url)` — handshake + frame loop, `WsHandshakeError` | [`websocket_echo.mojo`](../examples/basic/websocket_echo.mojo) |
+| `WsClient.split()` — full-duplex sender/receiver ownership with independent, idempotent shutdown; one application thread sends while another receives, and shutdown interrupts a blocked receiver | [`tests/ws/test_ws_duplex_wss.mojo`](../tests/ws/test_ws_duplex_wss.mojo), `flare.ws._duplex` |
 | `WsServer` — server-side handshake + frame loop | [`ws_server.mojo`](../examples/basic/ws_server.mojo) |
 | `WsHandler` trait + `WsServer.serve[H]` — stateful struct handler (per-connection state via `mut self`), the struct-handler twin of the `def(mut WsConnection)` callback | [`tests/ws/test_ws_stateful_handler.mojo`](../tests/ws/test_ws_stateful_handler.mojo) |
 | `WsMessage` — high-level text / binary message wrapper | [`ergonomics.mojo`](../examples/basic/ergonomics.mojo) |

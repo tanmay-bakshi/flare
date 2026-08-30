@@ -8,7 +8,7 @@
 # NOTE: When used as a pixi activation script, use 'return' not 'exit'
 # so the sourcing shell is not terminated.
 #
-# Install layout (matches ehsanmok/json's libsimdjson_wrapper.so):
+# Install layout:
 #   1. Build into $BUILD_DIR/libflare_tls.so (source-tree artifact).
 #   2. Copy to $CONDA_PREFIX/lib/libflare_tls.so — the CANONICAL location.
 # Mojo's _find_flare_lib* helpers resolve the library via CONDA_PREFIX, so

@@ -2,16 +2,13 @@
 
 The path/query/header concrete extractors are exercised in
 ``tests/http/test_extractors_concrete.mojo`` — this file focuses on
-the orthogonal surface: body extractors (``BodyBytes``,
-``BodyText``, ``Json``) and the reflective ``Extracted[H]`` adapter
-that turns a handler struct into a single request handler.
+the orthogonal surface: byte/text body extractors and the reflective
+``Extracted[H]`` adapter that turns a handler struct into a single request
+handler.
 """
 
 from std.testing import (
-    assert_true,
-    assert_false,
     assert_equal,
-    assert_raises,
     TestSuite,
 )
 
@@ -25,7 +22,6 @@ from flare.http import (
     OptionalQueryInt,
     BodyBytes,
     BodyText,
-    Json,
     Handler,
     Extracted,
 )
@@ -57,24 +53,6 @@ def test_body_text_empty() raises:
     var req = Request(method=Method.POST, url="/")
     var b = BodyText.extract(req)
     assert_equal(b.value, "")
-
-
-def test_json_happy() raises:
-    var req = Request(method=Method.POST, url="/", body=_body('{"n":7}'))
-    var j = Json.extract(req)
-    assert_equal(j.value["n"].int_value(), 7)
-
-
-def test_json_empty_body_raises() raises:
-    var req = Request(method=Method.POST, url="/")
-    with assert_raises():
-        _ = Json.extract(req)
-
-
-def test_json_malformed_raises() raises:
-    var req = Request(method=Method.POST, url="/", body=_body("{not json}"))
-    with assert_raises():
-        _ = Json.extract(req)
 
 
 # ── Extracted[H]: reflective auto-injection ─────────────────────────────────
@@ -153,7 +131,7 @@ def test_extracted_two_fields_opt_missing_defaults() raises:
 
 def main() raises:
     print("=" * 60)
-    print("test_extractors.mojo — Body extractors + Extracted[H]")
+    print("test_extractors.mojo — Byte/text extractors + Extracted[H]")
     print("=" * 60)
     print()
     TestSuite.discover_tests[__functions_in_module()]().run()

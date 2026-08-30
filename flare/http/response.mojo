@@ -2,7 +2,6 @@
 
 from std.collections import Optional
 
-from json import loads, Value
 from .body import Body, ChunkSource, InlineBody
 from .cancel import Cancel
 from .headers import HeaderMap
@@ -183,27 +182,6 @@ struct ResponseImpl[B: Body = InlineBody](Movable):
         for b in self.body:
             out += chr(Int(b))
         return out^
-
-    def json(self) raises -> Value:
-        """Parse the body as JSON and return a ``json.Value``.
-
-        Uses the pure-Mojo backend from
-        `json <https://github.com/ehsanmok/json>`_.
-
-        Returns:
-            A ``Value`` representing the parsed JSON document.
-
-        Raises:
-            Error: If the response body is not valid JSON.
-
-        Example:
-            ```mojo
-            var resp = client.get("https://httpbin.org/json")
-            var data = resp.json()
-            print(data["slideshow"]["title"].string_value())
-            ```
-        """
-        return loads(self.text())
 
     def raise_for_status(self) raises:
         """Raise ``HttpError`` if the status code is not 2xx.

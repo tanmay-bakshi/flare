@@ -14,7 +14,7 @@ Covers:
 - ServerConfig options (timeouts, limits)
 - Internal helpers (_find_crlfcrlf, _scan_content_length, _is_token_char)
 - Cookie parsing and serialisation
-- Request.json() and Request.text()
+- Request.text()
 """
 
 from std.testing import (
@@ -428,7 +428,7 @@ def test_redirect_301() raises:
     assert_equal(resp.headers.get("Location"), "/new-location")
 
 
-# ── Request.json() and Request.text() ─────────────────────────────────────────
+# ── Request.text() ────────────────────────────────────────────────────────────
 
 
 def test_request_text_empty() raises:
@@ -443,16 +443,6 @@ def test_request_text_with_body() raises:
         body.append(b)
     var req = Request(method="POST", url="/", body=body^)
     assert_equal(req.text(), "hello body")
-
-
-def test_request_json() raises:
-    var body_str = '{"key": "value"}'
-    var body = List[UInt8]()
-    for b in body_str.as_bytes():
-        body.append(b)
-    var req = Request(method="POST", url="/", body=body^)
-    var val = req.json()
-    assert_equal(val["key"].string_value(), "value")
 
 
 def test_request_content_length() raises:

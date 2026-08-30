@@ -112,8 +112,6 @@ Bad Request** with the error message in the body; the handler's
 # reflect[T].field_ref[idx].
 from std.builtin.rebind import trait_downcast
 from std.collections import Optional
-from json import loads, Value, Null
-
 from .handler import Handler
 from .headers import HeaderMap
 from .cookie import CookieJar
@@ -129,8 +127,6 @@ from ._extract_core import (
 )
 from ._extract_state import State
 from ._extract_typed import (
-    FromJson,
-    JsonAs,
     OptionalPathBool,
     OptionalPathFloat,
     OptionalPathInt,
@@ -167,9 +163,8 @@ from ..net import IpAddr, SocketAddr
 # - ``OptionalHeader`` × the same
 #
 # Plus the non-scalar request-shape extractors: ``Peer``,
-# ``BodyBytes``, ``BodyText``, ``Cookies``, ``Form``, ``Multipart``,
-# ``Json``. These live below the scalar block and follow the same
-# trait shape.
+# ``BodyBytes``, ``BodyText``, ``Cookies``, ``Form``, and ``Multipart``.
+# These live below the scalar block and follow the same trait shape.
 
 
 # ── Path concretes ──────────────────────────────────────────────────────────
@@ -267,8 +262,7 @@ struct PathBool[name: StaticString](Copyable, Defaultable, Extractor, Movable):
 # ── Optional path concretes ─────────────────────────────────────────────────
 #
 # ``OptionalPath{Int,Str,Float,Bool}`` live in ``_extract_typed`` (split out
-# for the file-size budget) and are re-exported below alongside the typed-JSON
-# extractors.
+# for the file-size budget) and are re-exported above.
 
 
 # ── Query concretes ─────────────────────────────────────────────────────────
@@ -817,30 +811,6 @@ struct Multipart(Copyable, Defaultable, Extractor, Movable):
             raise Error("missing multipart body")
         var ct = req.headers.get("content-type")
         self.value = parse_multipart_form_data(req.body, ct)
-
-    @staticmethod
-    def extract(req: Request) raises -> Self:
-        var out = Self()
-        out.apply(req)
-        return out^
-
-
-struct Json(Copyable, Defaultable, Extractor, Movable):
-    """Extracts the request body as a parsed ``json.Value``.
-
-    ``apply`` raises if the body is empty or not valid JSON; pair with
-    ``Extracted[H]`` to have the server map the error to a 400.
-    """
-
-    var value: Value
-
-    def __init__(out self):
-        self.value = Value(Null())
-
-    def apply(mut self, req: Request) raises:
-        if len(req.body) == 0:
-            raise Error("missing JSON body")
-        self.value = loads(req.text())
 
     @staticmethod
     def extract(req: Request) raises -> Self:

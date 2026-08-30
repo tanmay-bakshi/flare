@@ -8,8 +8,6 @@ namespaces import these directly. For multiple requests, use a shared
 ``HttpClient`` instead.
 """
 
-from json import dumps, Value as JsonValue
-
 from ..client import HttpClient
 from ..response import Response
 
@@ -56,25 +54,6 @@ def post(url: String, body: String) raises -> Response:
     return HttpClient().post(url, body)
 
 
-def post(url: String, body: JsonValue) raises -> Response:
-    """Perform a one-shot HTTP POST with a ``json.Value`` body.
-
-    Serialises ``body`` to JSON with ``dumps`` and sets
-    ``Content-Type: application/json`` automatically.
-
-    Args:
-        url: The target URL.
-        body: A ``json.Value`` to serialise and send.
-
-    Returns:
-        The server's ``Response``.
-
-    Raises:
-        NetworkError: On connection or I/O failure.
-    """
-    return HttpClient().post(url, body)
-
-
 def post(url: String, body: List[UInt8]) raises -> Response:
     """Perform a one-shot HTTP POST with a raw byte body.
 
@@ -99,25 +78,6 @@ def put(url: String, body: String) raises -> Response:
     Args:
         url: The target URL.
         body: The JSON request body as a ``String``.
-
-    Returns:
-        The server's ``Response``.
-
-    Raises:
-        NetworkError: On connection or I/O failure.
-    """
-    return HttpClient().put(url, body)
-
-
-def put(url: String, body: JsonValue) raises -> Response:
-    """Perform a one-shot HTTP PUT with a ``json.Value`` body.
-
-    Serialises ``body`` to JSON with ``dumps`` and sets
-    ``Content-Type: application/json`` automatically.
-
-    Args:
-        url: The target URL.
-        body: A ``json.Value`` to serialise and send.
 
     Returns:
         The server's ``Response``.
@@ -182,25 +142,6 @@ def patch(url: String, body: String) raises -> Response:
     Args:
         url: The target URL.
         body: The JSON request body as a ``String``.
-
-    Returns:
-        The server's ``Response``.
-
-    Raises:
-        NetworkError: On connection or I/O failure.
-    """
-    return HttpClient().patch(url, body)
-
-
-def patch(url: String, body: JsonValue) raises -> Response:
-    """Perform a one-shot HTTP PATCH with a ``json.Value`` body.
-
-    Serialises ``body`` to JSON with ``dumps`` and sets
-    ``Content-Type: application/json`` automatically.
-
-    Args:
-        url: The target URL.
-        body: A ``json.Value`` to serialise and send.
 
     Returns:
         The server's ``Response``.

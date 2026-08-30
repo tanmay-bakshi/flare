@@ -2,7 +2,6 @@
 
 from std.collections import Dict, Optional
 from std.memory import UnsafePointer, alloc
-from json import loads, Value
 from .headers import HeaderMap
 from .cookie import Cookie, CookieJar, parse_cookie_header
 from .proto.ascii import ascii_unchecked_string
@@ -420,17 +419,6 @@ struct Request(Movable):
         for b in self.body:
             out += chr(Int(b))
         return out^
-
-    def json(self) raises -> Value:
-        """Parse the request body as JSON.
-
-        Returns:
-            A ``json.Value`` representing the parsed JSON document.
-
-        Raises:
-            Error: If the body is not valid JSON.
-        """
-        return loads(self.text())
 
     def content_length(self) -> Int:
         """Return the Content-Length header value, or 0 if absent."""

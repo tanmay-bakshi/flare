@@ -40,11 +40,12 @@ to chew on while the upstream vendoring goes through license review.
 
 ## How to add an upstream corpus
 
-Each corpus directory has a `LICENSE` file copied verbatim from the
-upstream repository it was lifted from, an `ORIGIN.md` documenting the
-source commit hash + license + how to refresh, and a set of `*.json`
-fixture files in the format the conformance runner consumes (see
-`fixture-format.md`).
+Each vendored corpus directory has a `LICENSE` file copied verbatim from
+the upstream repository, an `ORIGIN.md` documenting the source commit hash,
+license, and refresh procedure, plus `*.json` source fixtures in the format
+described by `fixture-format.md`. Runtime tests use typed Mojo mirrors of
+those files. An exact file count and raw-byte fingerprint keep each mirror
+synchronized without adding a JSON dependency to flare or its test build.
 
 Vendoring policy:
 
@@ -93,9 +94,10 @@ Each fixture is a JSON file with a flat top-level structure:
   reject → accept).
 - `expected_*` — fields the parser must produce when `expect == "accept"`.
 
-The conformance runner (`tests/conformance/test_conformance_h1.mojo`)
-loads every `*.json` file under `conformance/h1/`, runs flare's parser
-on the hex bytes, and asserts the expected outcome. The WebSocket
-runner (`tests/conformance/test_conformance_ws.mojo`) does the same for
-`conformance/ws/` through `WsFrame.decode_one`, asserting opcode, FIN,
-post-unmask payload and close code on accept and a raise on reject.
+The HTTP/1 runner (`tests/conformance/test_conformance_h1.mojo`) runs the
+typed corpus through flare's parser and asserts each expected outcome. The
+WebSocket runner (`tests/conformance/test_conformance_ws.mojo`) runs its typed
+corpus through `WsFrame.decode_one`, asserting opcode, FIN, post-unmask
+payload and close code on accept and a raise on reject. Both runners also
+fingerprint the corresponding JSON source directory, so a source addition,
+removal, rename, or content edit requires an intentional mirror update.

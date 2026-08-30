@@ -169,12 +169,12 @@ def main() raises:
 
     var r = post("https://httpbin.org/post", '{"hello": "flare"}')
     r.raise_for_status()
-    var data = r.json()
-    print(data["json"]["hello"].string_value())
+    print(r.text())
 ```
 
 ``post`` with a String body sets ``Content-Type: application/json``
-automatically.
+automatically. JSON parsing stays in the application layer, so importing the
+HTTP or WebSocket client does not select or install a JSON implementation.
 
 The server-side sections below build gradually: each one adds one new
 concept on top of the previous example.
@@ -431,7 +431,8 @@ from flare.http import HttpClient, BasicAuth, BearerAuth
 
 def main() raises:
     var client = HttpClient("https://api.example.com", BearerAuth("tok_abc"))
-    var items = client.get("/items").json()
+    var items = client.get("/items")
+    print(items.text())
     client.post("/items", '{"name": "new"}').raise_for_status()
 ```
 
@@ -678,9 +679,6 @@ from .http.extract import (
     OptionalHeaderBool,
     BodyBytes,
     BodyText,
-    Json,
-    FromJson,
-    JsonAs,
     Cookies,
     Form,
     Multipart,

@@ -14,9 +14,8 @@ suitable for quick scripts. For multiple requests, prefer instantiating
 a shared ``HttpClient``.
 
 ``post`` and ``put`` accept a ``String`` body (sets
-``Content-Type: application/json`` automatically), a ``json.Value``
-body (serialised with ``dumps`` first), or a ``List[UInt8]`` body (sent
-as raw bytes with no implicit ``Content-Type``).
+``Content-Type: application/json`` automatically) or a ``List[UInt8]``
+body (sent as raw bytes with no implicit ``Content-Type``).
 
 Example:
     ```mojo
@@ -60,7 +59,6 @@ from ..tcp import TcpStream
 from ..tcp.stream import _connect_with_fallback
 from ..tls import TlsStream, TlsConfig
 from ..net import NetworkError
-from json import dumps, Value as JsonValue
 from ..net import SocketAddr
 from ..dns import resolve
 
@@ -194,7 +192,7 @@ struct HttpClient(Movable):
         # Session with base URL and auth — no repeated prefixes
         with HttpClient("https://api.example.com", BearerAuth("tok")) as c:
             c.post("/items", '{"name": "flare"}').raise_for_status()
-            var items = c.get("/items").json()
+            var body = c.get("/items").text()
         ```
     """
 
@@ -1488,25 +1486,6 @@ struct HttpClient(Movable):
         req.headers.set("Content-Type", "application/json")
         return self.send(req)
 
-    def post(self, url: String, body: JsonValue) raises -> Response:
-        """Perform a POST request with a ``json.Value`` body.
-
-        Serialises ``body`` to JSON with ``dumps`` and sets
-        ``Content-Type: application/json`` automatically.
-
-        Args:
-            url: The target URL (absolute or relative to ``base_url``).
-            body: A ``json.Value`` to serialise and send.
-
-        Returns:
-            The server's ``Response``.
-
-        Raises:
-            NetworkError: On connection or I/O failure.
-            TooManyRedirects: If the redirect limit is exceeded.
-        """
-        return self.post(url, dumps(body))
-
     def post(self, url: String, body: List[UInt8]) raises -> Response:
         """Perform a POST request with a raw byte body.
 
@@ -1551,25 +1530,6 @@ struct HttpClient(Movable):
         )
         req.headers.set("Content-Type", "application/json")
         return self.send(req)
-
-    def put(self, url: String, body: JsonValue) raises -> Response:
-        """Perform a PUT request with a ``json.Value`` body.
-
-        Serialises ``body`` to JSON with ``dumps`` and sets
-        ``Content-Type: application/json`` automatically.
-
-        Args:
-            url: The target URL (absolute or relative to ``base_url``).
-            body: A ``json.Value`` to serialise and send.
-
-        Returns:
-            The server's ``Response``.
-
-        Raises:
-            NetworkError: On connection or I/O failure.
-            TooManyRedirects: If the redirect limit is exceeded.
-        """
-        return self.put(url, dumps(body))
 
     def put(self, url: String, body: List[UInt8]) raises -> Response:
         """Perform a PUT request with a raw byte body.
@@ -1649,25 +1609,6 @@ struct HttpClient(Movable):
         )
         req.headers.set("Content-Type", "application/json")
         return self.send(req)
-
-    def patch(self, url: String, body: JsonValue) raises -> Response:
-        """Perform a PATCH request with a ``json.Value`` body.
-
-        Serialises ``body`` to JSON with ``dumps`` and sets
-        ``Content-Type: application/json`` automatically.
-
-        Args:
-            url: The target URL (absolute or relative to ``base_url``).
-            body: A ``json.Value`` to serialise and send.
-
-        Returns:
-            The server's ``Response``.
-
-        Raises:
-            NetworkError: On connection or I/O failure.
-            TooManyRedirects: If the redirect limit is exceeded.
-        """
-        return self.patch(url, dumps(body))
 
     def patch(self, url: String, body: List[UInt8]) raises -> Response:
         """Perform a PATCH request with a raw byte body.

@@ -3,12 +3,11 @@
 Tests for higher-level API features:
 - ``Auth`` trait + ``BasicAuth`` + ``BearerAuth``
 - ``HttpError`` + ``TooManyRedirects``
-- ``Response.raise_for_status()`` + ``Response.iter_bytes()`` + ``Response.json()``
-  (returns ``json.Value``)
+- ``Response.raise_for_status()`` + ``Response.iter_bytes()``
 - ``HttpClient`` constructors: ``HttpClient()``, ``HttpClient("base_url")``,
   ``HttpClient(auth)``, ``HttpClient("base_url", auth)``
-- ``post`` / ``put`` with ``String`` body (JSON auto-set), ``json.Value``
-  body (auto-serialised), and ``List[UInt8]`` body (raw bytes)
+- ``post`` / ``put`` with ``String`` body (JSON content type) and
+  ``List[UInt8]`` body (raw bytes)
 - Module-level ``get``, ``post``, ``put``, ``delete``, ``head`` helpers
 - ``TcpStream.connect(host, port)`` + ``TcpStream.connect(host, port, timeout_ms)``
 - Context managers on ``TcpStream``, ``UdpSocket``
@@ -189,16 +188,6 @@ def test_response_raise_for_status_301() raises:
     except:
         raised = True
     assert_true(raised, "HttpError must be raised for 3xx")
-
-
-def test_response_json_parses_value() raises:
-    """``Response.json()`` parses the body as a ``json.Value``."""
-    var body = List[UInt8]()
-    for b in String('{"x": 1}').as_bytes():
-        body.append(b)
-    var resp = Response(status=200, body=body^)
-    var data = resp.json()
-    assert_equal(data["x"].int_value(), 1)
 
 
 def test_response_iter_bytes_whole() raises:
@@ -525,7 +514,6 @@ def main() raises:
     test_response_raise_for_status_404()
     test_response_raise_for_status_500()
     test_response_raise_for_status_301()
-    test_response_json_parses_value()
     test_response_iter_bytes_whole()
     test_response_iter_bytes_chunks()
     test_response_iter_bytes_empty()

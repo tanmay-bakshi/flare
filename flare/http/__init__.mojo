@@ -22,7 +22,7 @@ from flare.http import (
 - `HttpClient` — Send HTTP/HTTPS requests: `get`, `post`, `put`, etc.
 - `HttpServer` — Accept and dispatch HTTP requests.
 - `Request` — HTTP request (method, URL, headers, body).
-- `Response` — HTTP response (status, headers, body, `text()`, `json()`).
+- `Response` — HTTP response (status, headers, body, `text()`).
 - `HeaderMap` — Case-insensitive HTTP header collection.
 - `HeaderInjectionError` — Raised on CR/LF characters in header names or values.
 - `Url` — Parsed HTTP/HTTPS URL (scheme, host, port, path, query).
@@ -46,7 +46,7 @@ from flare.http import (
 - `Peer`
   — Extracts the kernel-reported peer ``SocketAddr`` populated by the
     reactor at accept time.
-- `BodyBytes`, `BodyText`, `Json`, `Cookies`, `Form`, `Multipart`
+- `BodyBytes`, `BodyText`, `Cookies`, `Form`, `Multipart`
   — Extractors that read the request body.
 - `FormData`, `parse_form_urlencoded`, `urlencode`, `urldecode`
   — ``application/x-www-form-urlencoded`` parsing helpers.
@@ -69,8 +69,8 @@ from flare.http import (
     terminator, then ``memcpy``s the canned bytes into the write
     queue. No ``Request``, no handler, no response serialisation.
 - `get`, `post`, `put`, `delete`, `head` — Module-level one-shot helpers.
-  `post` and `put` accept a `String` (JSON auto-set), `json.Value`
-  (auto-serialised), or `List[UInt8]` (raw bytes).
+  `post` and `put` accept a `String` (JSON content type) or `List[UInt8]`
+  (raw bytes).
 
 ## Example
 
@@ -91,9 +91,9 @@ def main() raises:
         r.raise_for_status()
         print(r.text())
 
-    # Parse JSON response body (returns json.Value)
-    var data = HttpClient().get("https://httpbin.org/json").json()
-    print(data["slideshow"]["title"].string_value())
+    # The transport core exposes response text without choosing a JSON codec.
+    var data = HttpClient().get("https://httpbin.org/json")
+    print(data.text())
 ```
 """
 
@@ -186,9 +186,6 @@ from .extract import (
     Peer,
     BodyBytes,
     BodyText,
-    Json,
-    FromJson,
-    JsonAs,
     Cookies,
     Form,
     Multipart,
@@ -216,7 +213,6 @@ from .server import (
     ShutdownReport,
     ok,
     ok_json,
-    ok_json_value,
     bad_request,
     unauthorized,
     forbidden,

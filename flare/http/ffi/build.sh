@@ -8,7 +8,7 @@
 # NOTE: When used as a pixi activation script, use 'return' not 'exit'
 # so the sourcing shell is not terminated.
 #
-# Install layout (matches flare/tls/ffi/build.sh and ehsanmok/json):
+# Install layout (matches flare/tls/ffi/build.sh):
 #   1. Build into $BUILD_DIR/libflare_zlib.so (source-tree artifact).
 #   2. Copy to $CONDA_PREFIX/lib/libflare_zlib.so — the CANONICAL location.
 # Mojo's _find_flare_zlib_lib resolves via CONDA_PREFIX, so anything pixi

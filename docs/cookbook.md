@@ -41,7 +41,7 @@ basics.
 | File | What it shows |
 |---|---|
 | [`extractors.mojo`](../examples/intermediate/extractors.mojo) | Typed extractors (`PathInt`, `QueryStr`, `HeaderStr`, ...), reflective `Extracted[H]` auto-injection, and `State[T]` registration-time injection alongside request extractors |
-| [`typed_extractors.mojo`](../examples/intermediate/typed_extractors.mojo) | `OptionalPath{Int,Str,Float,Bool}` optional path params + `JsonAs[T: FromJson]` typed-body deserialization |
+| [`typed_extractors.mojo`](../examples/intermediate/typed_extractors.mojo) | `OptionalPath{Int,Str,Float,Bool}` path params that may be absent |
 | [`state.mojo`](../examples/intermediate/state.mojo) | Shared application state via a captured wrapping `Handler` (a `Counters` snapshot tagged onto responses) -- the no-injection pattern; for injected state beside extractors see `State[T]` in `extractors.mojo` |
 | [`middleware.mojo`](../examples/intermediate/middleware.mojo) | Middleware composition (outside-in): `RequestID` → `Logger` → `Timing` → `Recover` → `RequireAuth` → `Router` |
 | [`middleware_stack.mojo`](../examples/intermediate/middleware_stack.mojo) | `Logger` + `RequestId` + `Compress` + `CatchPanic` chain |
@@ -58,7 +58,6 @@ basics.
 | [`cors.mojo`](../examples/intermediate/cors.mojo) | `Cors` permissive vs allowlist + preflight + credentials |
 | [`static_files.mojo`](../examples/intermediate/static_files.mojo) | `FileServer` with HEAD + Range + path safety |
 | [`brotli.mojo`](../examples/intermediate/brotli.mojo) | `compress_brotli` / `decompress_brotli` + `Compress` middleware emitting `br` |
-| [`ok_json_typed.mojo`](../examples/intermediate/ok_json_typed.mojo) | Typed JSON request → typed JSON response via `ok_json_value` |
 | [`infallible_handler.mojo`](../examples/intermediate/infallible_handler.mojo) | `HandlerInfallible` + `WithRaises` adapter for provably no-`raises` paths |
 | [`trailers.mojo`](../examples/intermediate/trailers.mojo) | HTTP/1.1 trailer fields (gRPC-style status trailer): `Response.trailers`, `Trailer:` header, smuggling guard |
 | [`multi_listener.mojo`](../examples/intermediate/multi_listener.mojo) | `HttpServer.bind_many` over multiple distinct addresses, single accept loop |
@@ -137,7 +136,6 @@ natural.
 | Configure CORS | [`cors.mojo`](../examples/intermediate/cors.mojo) |
 | Serve static files (with `Range`) | [`static_files.mojo`](../examples/intermediate/static_files.mojo) |
 | Send `Content-Encoding: br` | [`brotli.mojo`](../examples/intermediate/brotli.mojo) |
-| Return a typed JSON response | [`ok_json_typed.mojo`](../examples/intermediate/ok_json_typed.mojo) |
 | Use a no-`raises` handler | [`infallible_handler.mojo`](../examples/intermediate/infallible_handler.mojo) |
 | Compile-time route table | [`comptime_router.mojo`](../examples/advanced/comptime_router.mojo) |
 | Drive the reactor directly | [`reactor.mojo`](../examples/advanced/reactor.mojo) |
@@ -178,9 +176,9 @@ that gets you the value you need.
 | **Path params** | Value matched by a Router path segment (`:name`) | `req.param("id") raises -> String`, `req.has_param`, `req.params_mut()["id"] = ...` | The URL path itself carries the value. `param` raises if the segment didn't match (use `has_param` to peek). |
 | **Query params** | Single value from the URL's query string | `req.query_param("k") -> String` (returns `""` if missing), `req.has_query_param` | Querystring `?k=v` style data; return-value-on-miss makes one-line reads natural. |
 | **Cookies** | Inbound `Cookie` header parsed into name/value pairs | `req.cookies() -> CookieJar`, `req.cookie("name") -> String` (returns `""` if missing), `req.has_cookie` | Inspecting an inbound `Cookie` header directly. For typed extraction prefer the `Cookies` extractor. |
-| **Body decoding** | Body interpreted as text / JSON / raw bytes | `req.text() -> String`, `req.json() raises -> json.Value`, `req.body: List[UInt8]` | Reading the body opportunistically inside a handler without an extractor. |
+| **Body decoding** | Body interpreted as text or raw bytes | `req.text() -> String`, `req.body: List[UInt8]` | Reading the transport body without selecting an application codec. |
 | **`*.extract(req)` extractors** | Typed value from the body or a header set | `Form.extract(req) -> Form`, `Multipart.extract(req) -> MultipartForm`, `Cookies.extract(req) -> Cookies` | Hand-written extractor pipeline; reach for this when the auto-injection adapter is overkill but you still want typed parsing. |
-| **Comptime-keyed extractors** | Single typed primitive keyed at compile time | `PathInt["id"]`, `QueryStr["q"]`, `OptionalQueryInt["page"]`, `HeaderStr["Authorization"]`, `Json[T]` | Building blocks for the auto-injection shape (next row); each one is a `Defaultable` struct with a `value` field. |
+| **Comptime-keyed extractors** | Single typed primitive keyed at compile time | `PathInt["id"]`, `QueryStr["q"]`, `OptionalQueryInt["page"]`, `HeaderStr["Authorization"]` | Building blocks for the auto-injection shape (next row); each one is a `Defaultable` struct with a `value` field. |
 | **`Extracted[H]` auto-injection** | A handler struct whose fields are the extractor set; the adapter walks the field list per request and populates each | `r.get("/users/:id", Extracted[GetUser]())` where `GetUser(HandlerExtractor)` declares `id: PathInt["id"]` etc. | Production handler shape: declarative, typed, monomorphised. The adapter raises 400 with the parser error on extractor failure; `serve` raises propagate to 500. |
 
 Examples that exercise each shape, in order: the [`router.mojo`](../examples/basic/router.mojo)
@@ -188,6 +186,6 @@ example covers plain field + path param shapes; [`request_cookies.mojo`](../exam
 walks the cookie surface; [`forms.mojo`](../examples/intermediate/forms.mojo)
 and [`multipart_upload.mojo`](../examples/intermediate/multipart_upload.mojo)
 use the `*.extract(req)` extractors; [`extractors.mojo`](../examples/intermediate/extractors.mojo)
-and [`ok_json_typed.mojo`](../examples/intermediate/ok_json_typed.mojo)
+and [`typed_extractors.mojo`](../examples/intermediate/typed_extractors.mojo)
 show comptime-keyed extractors and the `Extracted[H]` auto-injection
 adapter.

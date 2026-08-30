@@ -1,6 +1,6 @@
 """Response constructors extracted from ``flare.http.server``.
 
-The public ``ok`` / ``ok_json`` / ``ok_json_value`` / ``bad_request`` /
+The public ``ok`` / ``ok_json`` / ``bad_request`` /
 ``not_found`` / ``internal_error`` / ``redirect`` helpers plus the
 shared ``String`` -> ``List[UInt8]`` copy. ``flare.http.server``
 re-exports every name here, so the public ``flare.http`` /
@@ -8,8 +8,6 @@ re-exports every name here, so the public ``flare.http`` /
 """
 
 from std.memory import unsafe_memcpy
-
-from json import dumps, Value as JsonValue
 
 from ..response import Response, Status
 
@@ -60,49 +58,13 @@ def ok_json(body: String) -> Response:
     """Create a 200 OK response with a JSON body.
 
     Args:
-        body: Pre-serialised JSON string to send. Use the
-              :func:`ok_json_value` overload below if you have a
-              typed :class:`json.Value` and want the framework to
-              serialise it for you (the symmetric output mirror of
-              the :class:`flare.http.Json[T]` extractor).
+        body: Pre-serialised JSON string to send.
 
     Returns:
         A ``Response`` with ``Content-Type: application/json``.
     """
     var resp = Response(
         status=Status.OK, reason="OK", body=_string_to_bytes(body)
-    )
-    try:
-        resp.headers.set("Content-Type", "application/json")
-    except:
-        pass
-    return resp^
-
-
-def ok_json_value(value: JsonValue) raises -> Response:
-    """Create a 200 OK response from a typed :class:`json.Value`.
-
-    The output-side symmetric mirror of the :class:`Json[T]` input
-    extractor: a handler that takes ``Json[User]`` to read a typed
-    request body can return ``ok_json_value(updated_user)`` to ship
-    the updated value back without manual string concatenation.
-
-    Args:
-        value: A :class:`json.Value` (object / array / string /
-               number / bool / null). Serialised via
-               :func:`json.dumps` and emitted with
-               ``Content-Type: application/json``.
-
-    Returns:
-        A ``Response`` with status 200 and the serialised JSON body.
-
-    Raises:
-        Error: When :func:`json.dumps` rejects the value (cyclic
-               reference, etc.).
-    """
-    var serialised = dumps(value)
-    var resp = Response(
-        status=Status.OK, reason="OK", body=_string_to_bytes(serialised)
     )
     try:
         resp.headers.set("Content-Type", "application/json")

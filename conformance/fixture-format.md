@@ -22,13 +22,12 @@ Each fixture is a JSON file. Naming convention:
 ```
 
 - `input_hex` is a flat string of 2-character hex pairs separated by
-  ASCII space. Whitespace between pairs is collapsed during loading.
+  ASCII space. Whitespace between pairs is collapsed by the typed runner.
   Comments inside the hex string are not supported; the JSON `name`
   field is the place for human notes.
-- `leniency` is keyed by `_ExperimentalH1LeniencyConfig` field name. Any omitted
-  field uses the strict default (`False`). The conformance runner
-  hands the resulting config to the parser before applying the input
-  bytes.
+- `leniency` is keyed by `H1LeniencyConfig` field name. Any omitted field uses
+  the strict default (`False`). The typed mirror constructs that config before
+  applying the input bytes.
 - `expected_method` / `expected_uri` / `expected_version` are required
   only when `expect == "accept"` and the fixture is a request-line
   test. Header / body fixtures will grow `expected_headers` /
@@ -42,19 +41,23 @@ Each fixture is a JSON file. Naming convention:
    ABNF grammar in the RFC).
 3. Convert to space-separated hex with `xxd -p -c 1 | tr '\n' ' '`.
 4. Drop the JSON in the appropriate `conformance/<area>/` subdir.
-5. Re-run the conformance runner (`pixi run test-conformance-h1`).
-6. If the fixture is sensitive to a leniency flag, document the flag
+5. Add the equivalent typed case and ordered source filename to the area's
+   runner, then update its expected raw-byte corpus fingerprint.
+6. Re-run the conformance runner (`pixi run test-conformance-h1` or
+   `pixi run test-conformance-ws`).
+7. If the fixture is sensitive to a leniency flag, document the flag
    under `leniency`.
 
-The runner loads every `*.json` in `conformance/h1/` automatically;
-new fixtures need no test-code change.
+The JSON files are reviewable source artifacts, not runtime inputs. Each
+runner checks their exact count and raw-byte fingerprint before exercising its
+typed Mojo mirror, so corpus drift fails the suite without requiring a JSON
+library.
 
 ## WebSocket schema (`conformance/ws/`)
 
 WebSocket fixtures live in `conformance/ws/` and follow the same
 `accept`/`reject` shape with WS-specific expected-* fields. The
-runner is `tests/conformance/test_conformance_ws.mojo`; new
-fixtures are picked up automatically.
+runner is `tests/conformance/test_conformance_ws.mojo`.
 
 ```
 {

@@ -192,7 +192,7 @@ trait SessionCodec(Copyable, Defaultable, Deinitable, Movable):
     Implementations live alongside the user's payload type; the
     bundled ``StringSessionCodec`` carries opaque strings which is
     enough for the common "username + roles JSON blob" use case
-    when paired with ``flare.json``.
+    when paired with the application's chosen JSON codec.
     """
 
     @staticmethod
@@ -208,7 +208,7 @@ trait SessionCodec(Copyable, Defaultable, Deinitable, Movable):
 struct StringSessionCodec(Copyable, Defaultable, Movable, SessionCodec):
     """The default codec: payload is just a UTF-8 string.
 
-    Pair with ``flare.json``-encoded text payloads (or any other
+    Pair with JSON-encoded text payloads (or any other
     string serialisation) when richer types are needed without
     writing a new codec.
     """
@@ -261,9 +261,8 @@ struct Session(Copyable, Defaultable, Movable):
     Construction: ``Session.empty()`` / ``Session(value)``.
 
     Field ``value`` is a ``String`` to keep the public surface
-    simple; pair with ``flare.json`` if you need to roundtrip a
-    structured payload (encode JSON in the handler, decode on the
-    way out).
+    simple; pair with an application codec if you need to roundtrip a
+    structured payload.
     """
 
     var value: String

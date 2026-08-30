@@ -1,17 +1,12 @@
-"""``flare.http._extract_typed`` -- optional-path + typed-JSON extractors.
+"""Optional path extractors.
 
 Split out of :mod:`flare.http.extract` to keep that file within the
 file-size budget. Holds the ``OptionalPath{Int,Str,Float,Bool}``
-concretes (a path capture that may be absent) and the typed-JSON body
-path (:trait:`FromJson` + :struct:`JsonAs`). ``flare.http.extract``
-re-exports all of these so existing
-``from flare.http import OptionalPathInt`` / ``JsonAs`` call sites keep
-resolving.
+concretes for path captures that may be absent. ``flare.http.extract``
+re-exports all of them.
 """
 
 from std.collections import Optional
-
-from json import loads, Value
 
 from ._extract_core import (
     Extractor,
@@ -126,81 +121,6 @@ struct OptionalPathBool[name: StaticString](
         self.value = Optional[Bool](
             _parse_bool_param(req.param(String(Self.name)))
         )
-
-    @staticmethod
-    def extract(req: Request) raises -> Self:
-        var out = Self()
-        out.apply(req)
-        return out^
-
-
-# ── Typed JSON body extraction ──────────────────────────────────────────────
-
-
-trait FromJson(Copyable, Defaultable, Deinitable, Movable):
-    """A type that can populate itself from a parsed JSON ``Value``.
-
-    Implement ``parse_json`` to read the decoded document into ``self``
-    (raising on a missing / wrong-typed field). Conforming types plug
-    into :struct:`JsonAs` for typed request-body extraction, the
-    typed mirror of the dynamic :struct:`Json` extractor.
-
-    Example:
-        ```mojo
-        from json import Value
-        from flare.http import FromJson
-
-        @fieldwise_init
-        struct CreateUser(Copyable, Defaultable, FromJson, Movable):
-            var name: String
-            var age: Int
-
-            def __init__(out self):
-                self.name = ""
-                self.age = 0
-
-            def parse_json(mut self, value: Value) raises:
-                self.name = value["name"].string_value()
-                self.age = Int(value["age"].int_value())
-        ```
-    """
-
-    def parse_json(mut self, value: Value) raises:
-        ...
-
-
-struct JsonAs[T: FromJson](Copyable, Defaultable, Extractor, Movable):
-    """Extracts + deserializes the request body into a typed ``T: FromJson``.
-
-    The typed counterpart to :struct:`Json` (which yields a dynamic
-    ``json.Value``). ``apply`` raises on an empty body, invalid JSON,
-    or any failure ``T.parse_json`` reports; pair with ``Extracted[H]``
-    to map those to 400.
-
-    Example:
-        ```mojo
-        @fieldwise_init
-        struct Create(Copyable, Defaultable, Handler, Movable):
-            var body: JsonAs[CreateUser]
-
-            def __init__(out self):
-                self.body = JsonAs[CreateUser]()
-
-            def serve(self, req: Request) raises -> Response:
-                return ok("hello " + self.body.value.name)
-        # r.post("/users", Extracted[Create]())
-        ```
-    """
-
-    var value: Self.T
-
-    def __init__(out self):
-        self.value = Self.T()
-
-    def apply(mut self, req: Request) raises:
-        if len(req.body) == 0:
-            raise Error("missing JSON body")
-        self.value.parse_json(loads(req.text()))
 
     @staticmethod
     def extract(req: Request) raises -> Self:

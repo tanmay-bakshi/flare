@@ -19,8 +19,6 @@ Key performance characteristics:
 from std.memory import memcpy, stack_allocation
 from std.ffi import c_int, c_uint, external_call
 
-from json import dumps, Value as JsonValue
-
 from ..runtime._libc_time import libc_nanosleep_ms
 
 from std.collections import Optional
@@ -1624,7 +1622,6 @@ from ._server.responses import (
     not_found,
     ok,
     ok_json,
-    ok_json_value,
     redirect,
     unauthorized,
 )

@@ -174,6 +174,37 @@ def test_ws_autoclient_loopback_binary_round_trip() raises:
     _kill(pid)
 
 
+def test_ws_autoclient_negotiates_configured_subprotocol() raises:
+    var srv = WsServer.bind(
+        SocketAddr.localhost(0), subprotocols=["chat.v2", "chat.v1"]
+    )
+    var port = srv.local_addr().port
+    var pid = _spawn_ws_server(srv^)
+
+    var failure = String("")
+    try:
+        var cfg = WsAutoClientConfig()
+        cfg.url = String("ws://127.0.0.1:") + String(port) + String("/chat")
+        cfg.subprotocols = ["chat.v1", "chat.v2"]
+        var auto = WsAutoClient(cfg^)
+        auto.connect()
+        var selected = auto.negotiated_subprotocol()
+        assert_true(selected)
+        assert_equal(selected.value(), "chat.v2")
+
+        var ws = auto.take_h1_client()
+        var carrier_selected = ws.negotiated_subprotocol()
+        assert_true(carrier_selected)
+        assert_equal(carrier_selected.value(), "chat.v2")
+        ws.send_text("protocol")
+        assert_equal(ws.recv().text_payload(), "protocol")
+    except error:
+        failure = String(error)
+    _kill(pid)
+    if failure.byte_length() > 0:
+        raise Error(failure)
+
+
 def test_ws_autoclient_wss_unreachable_local_port() raises:
     """``wss://`` against a local port that has no TLS responder
     drives the dispatcher's TLS-handshake path through the
@@ -210,6 +241,8 @@ def main() raises:
     print("OK test_ws_autoclient_loopback_prefer_h2_false")
     test_ws_autoclient_loopback_binary_round_trip()
     print("OK test_ws_autoclient_loopback_binary_round_trip")
+    test_ws_autoclient_negotiates_configured_subprotocol()
+    print("OK test_ws_autoclient_negotiates_configured_subprotocol")
     test_ws_autoclient_wss_unreachable_local_port()
     print("OK test_ws_autoclient_wss_unreachable_local_port")
-    print("test_ws_autoclient_loopback: 4 passed")
+    print("test_ws_autoclient_loopback: 5 passed")

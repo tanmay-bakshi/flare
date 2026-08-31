@@ -40,6 +40,7 @@ from std.memory import UnsafePointer
 
 from ..http.url import Url
 from ..http2.client import Http2ClientConnection
+from ..http2.hpack import HpackHeader
 from ..tls import TlsConfig, TlsStream
 from .client import (
     WsClient,
@@ -49,6 +50,42 @@ from .client import (
     _ws_url_to_http,
 )
 from .client_h2 import WsOverH2Stream, bootstrap_ws_over_h2
+from ._subprotocol import (
+    _contains_subprotocol,
+    _parse_subprotocol_selection,
+    _render_subprotocols,
+)
+
+
+def _validate_h2_subprotocol_response(
+    headers: List[HpackHeader], offered: List[String]
+) raises -> Optional[String]:
+    """Validate the singular RFC 8441 selection against the offer."""
+    var selected = Optional[String]()
+    for header in headers:
+        if header.name != "sec-websocket-protocol":
+            continue
+        if selected:
+            raise WsHandshakeError(
+                "server returned multiple Sec-WebSocket-Protocol headers"
+            )
+        try:
+            selected = Optional[String](
+                _parse_subprotocol_selection(header.value)
+            )
+        except:
+            raise WsHandshakeError("invalid Sec-WebSocket-Protocol response")
+
+    if selected:
+        if len(offered) == 0:
+            raise WsHandshakeError(
+                "server selected a WebSocket subprotocol when none was offered"
+            )
+        if not _contains_subprotocol(offered, selected.value()):
+            raise WsHandshakeError(
+                "server selected an unoffered WebSocket subprotocol"
+            )
+    return selected^
 
 
 # ── Wire choice codepoints ─────────────────────────────────────────────
@@ -258,12 +295,15 @@ struct WsAutoClient(Movable):
     picked the h2 path. Populated by :meth:`connect`; consumed
     by :meth:`take_h2_carrier`."""
 
+    var _negotiated_subprotocol: Optional[String]
+
     def __init__(out self, var config: WsAutoClientConfig):
         self.config = config^
         self.chosen_wire = WsWireChoice.UNDETERMINED
         self.last_error = String("")
         self._h1_client = None
         self._h2_carrier = None
+        self._negotiated_subprotocol = None
 
     def url_scheme(self) -> String:
         """Return ``"ws"`` or ``"wss"`` -- the parsed scheme from
@@ -302,6 +342,10 @@ struct WsAutoClient(Movable):
         """``True`` after a successful connect picked HTTP/2
         Extended CONNECT. Pairs with :meth:`take_h2_carrier`."""
         return self.chosen_wire == WsWireChoice.HTTP_2
+
+    def negotiated_subprotocol(self) -> Optional[String]:
+        """Return the protocol selected by the established carrier."""
+        return self._negotiated_subprotocol.copy()
 
     def take_h1_client(mut self) raises -> WsClient:
         """Consume + return the HTTP/1.1 :class:`WsClient` the
@@ -388,6 +432,10 @@ struct WsAutoClient(Movable):
             raise e^
 
     def _connect_impl(mut self) raises:
+        try:
+            _ = _render_subprotocols(self.config.subprotocols)
+        except error:
+            raise WsHandshakeError(String(error))
         var scheme = self.url_scheme()
         if scheme == "":
             raise WsHandshakeError(
@@ -397,7 +445,10 @@ struct WsAutoClient(Movable):
             )
 
         if scheme == "ws":
-            var c = WsClient.connect(self.config.url)
+            var c = WsClient.connect(
+                self.config.url, subprotocols=self.config.subprotocols
+            )
+            self._negotiated_subprotocol = c.negotiated_subprotocol()
             self._h1_client = Optional[WsClient](c^)
             self.chosen_wire = WsWireChoice.HTTP_1_1
             return
@@ -406,7 +457,12 @@ struct WsAutoClient(Movable):
             var cfg = self.config.tls_config.copy()
             cfg.alpn = List[String]()
             cfg.alpn.append("http/1.1")
-            var c = WsClient.connect(self.config.url, cfg^)
+            var c = WsClient.connect(
+                self.config.url,
+                cfg^,
+                subprotocols=self.config.subprotocols,
+            )
+            self._negotiated_subprotocol = c.negotiated_subprotocol()
             self._h1_client = Optional[WsClient](c^)
             self.chosen_wire = WsWireChoice.HTTP_1_1
             return
@@ -435,7 +491,12 @@ struct WsAutoClient(Movable):
         var h1_cfg = self.config.tls_config.copy()
         h1_cfg.alpn = List[String]()
         h1_cfg.alpn.append("http/1.1")
-        var c = WsClient.connect(self.config.url, h1_cfg^)
+        var c = WsClient.connect(
+            self.config.url,
+            h1_cfg^,
+            subprotocols=self.config.subprotocols,
+        )
+        self._negotiated_subprotocol = c.negotiated_subprotocol()
         self._h1_client = Optional[WsClient](c^)
         self.chosen_wire = WsWireChoice.HTTP_1_1
 
@@ -509,6 +570,11 @@ struct WsAutoClient(Movable):
         # 3. Bootstrap the Extended CONNECT stream.
         var sid = h2.next_stream_id()
         var ws_key = _generate_ws_key()
+        var subprotocol_offer: String
+        try:
+            subprotocol_offer = _render_subprotocols(self.config.subprotocols)
+        except error:
+            raise WsHandshakeError(String(error))
         var authority = u.host
         if u.port != UInt16(443):
             authority = authority + ":" + String(Int(u.port))
@@ -518,7 +584,7 @@ struct WsAutoClient(Movable):
             authority,
             u.request_target(),
             ws_key,
-            String(""),
+            subprotocol_offer,
             String(""),
             String("https"),
         )
@@ -558,6 +624,9 @@ struct WsAutoClient(Movable):
                 "WsAutoClient: Extended CONNECT rejected, status = "
                 + String(resp.status)
             )
+        self._negotiated_subprotocol = _validate_h2_subprotocol_response(
+            resp.headers, self.config.subprotocols
+        )
 
         var stream = WsOverH2Stream(sid)
         self._h2_carrier = Optional[_WsAutoH2Carrier](

@@ -34,7 +34,9 @@ The 13 test cases:
     when the dispatcher hasn't picked the matching path.
 """
 
-from std.testing import assert_equal, assert_false, assert_true
+from std.testing import assert_equal, assert_false, assert_raises, assert_true
+
+from flare.http2.hpack import HpackHeader
 
 from flare.ws import (
     WsAutoClient,
@@ -42,6 +44,7 @@ from flare.ws import (
     WsWireChoice,
     decide_wire,
 )
+from flare.ws.auto_client import _validate_h2_subprotocol_response
 
 
 def _config_for(url: String, prefer_h2: Bool = True) -> WsAutoClientConfig:
@@ -194,6 +197,36 @@ def test_take_methods_guard_state() raises:
     assert_false(auto.is_h2_path())
 
 
+def test_h2_subprotocol_selection_is_validated() raises:
+    var selected = _validate_h2_subprotocol_response(
+        [HpackHeader("sec-websocket-protocol", "chat.v1")],
+        ["chat.v1"],
+    )
+    assert_true(selected)
+    assert_equal(selected.value(), "chat.v1")
+
+    var declined = _validate_h2_subprotocol_response([], ["chat.v1"])
+    assert_false(declined)
+    with assert_raises(contains="unoffered"):
+        _ = _validate_h2_subprotocol_response(
+            [HpackHeader("sec-websocket-protocol", "chat.v2")],
+            ["chat.v1"],
+        )
+    with assert_raises(contains="when none was offered"):
+        _ = _validate_h2_subprotocol_response(
+            [HpackHeader("sec-websocket-protocol", "chat.v1")], []
+        )
+
+
+def test_autoclient_rejects_invalid_subprotocol_before_dial() raises:
+    var cfg = _config_for(String("ws://127.0.0.1:1/chat"))
+    cfg.subprotocols = ["not a token"]
+    var auto = WsAutoClient(cfg^)
+    with assert_raises(contains="invalid WebSocket subprotocol token"):
+        auto.connect()
+    assert_equal(auto.chosen_wire, WsWireChoice.FAILED)
+
+
 def main() raises:
     test_wire_choice_codepoints()
     test_config_defaults()
@@ -209,4 +242,6 @@ def main() raises:
     test_url_scheme_parses_ws()
     test_connect_unreachable_host_surfaces_failure()
     test_take_methods_guard_state()
-    print("test_ws_autoclient: 14 passed")
+    test_h2_subprotocol_selection_is_validated()
+    test_autoclient_rejects_invalid_subprotocol_before_dial()
+    print("test_ws_autoclient: 16 passed")

@@ -8,20 +8,27 @@ clean close handshake. SIMD-accelerated payload masking for payloads ≥128 byte
 
 ```mojo
 from flare.ws import (
-    WsClient, WsConnectAttempt, WsServer, WsDuplex,
+    WsClient, WsConnectAttempt, WsServer, WsServerRuntime, WsServerStop,
+    WsDuplex,
     WsSender, WsReceiver, WsShutdown,
     WsFrame, WsOpcode, WsCloseCode,
     WsProtocolError, WsHandshakeError,
 )
 ```
 
-- `WsClient` — WebSocket client: `connect`, `connect_attempt`, `send_text`,
-  `send_binary`, `recv`, `close`, and the consuming `split` operation.
+- `WsClient` — WebSocket client: `connect`, `connect_attempt`, strict
+  subprotocol negotiation, `send_text`, `send_binary`, `recv`, `close`, and
+  the consuming `split` operation.
 - `WsConnectAttempt` — cancellable DNS-through-Upgrade attempt with an
   absolute handshake deadline and a shutdown handle available before dialing.
 - `WsDuplex` — Linear carrier returned by `WsClient.split()` for one sender
   thread, one receiver thread, and an independent shutdown owner.
-- `WsServer` — WebSocket server: upgrades HTTP connections to WebSocket.
+- `WsSender.send_*_until` — deadline-aware duplex publication against an
+  absolute monotonic timestamp. A `False` result requires immediate shutdown.
+- `WsServer` — WebSocket server: upgrades HTTP connections and selects the
+  first server-preferred subprotocol offered by each client. Its consuming
+  `serve_stoppable` path returns a linear `WsServerRuntime` and an independent
+  `WsServerStop` admission fence.
 - `WsFrame` — A single WebSocket frame: `text`, `binary`, `ping`, `pong`, `close`.
 - `WsOpcode` — Opcode byte constants (`TEXT`, `BINARY`, `PING`, `PONG`, `CLOSE`).
 - `WsCloseCode` — Close status code constants (`NORMAL`, `GOING_AWAY`, …).
@@ -98,6 +105,21 @@ var client = attempt^.connect()
 The shutdown handle exists before DNS begins and remains authoritative after
 the completed client is split. The timeout is one absolute DNS-through-Upgrade
 deadline, not a fresh budget for each phase.
+
+### Subprotocol negotiation
+
+```mojo
+var ws = WsClient.connect(
+    "wss://example.com/stream",
+    subprotocols=["events.v2", "events.v1"],
+)
+var selected = ws.negotiated_subprotocol()
+```
+
+A server may decline an offer. When it selects a protocol, the client verifies
+that the response names exactly one offered token. Servers declare their
+preference order with ``WsServer.bind(addr, subprotocols=[...])``; both
+``WsClient`` and the accepted ``WsConnection`` expose the optional selection.
 """
 
 from .frame import WsFrame, WsOpcode, WsCloseCode, WsProtocolError
@@ -111,7 +133,14 @@ from .client import (
     WsShutdown,
     WsDuplex,
 )
-from .server import WsHandler, WsServer, WsConnection, WsUpgradeRequest
+from .server import (
+    WsHandler,
+    WsServer,
+    WsServerStop,
+    WsServerRuntime,
+    WsConnection,
+    WsUpgradeRequest,
+)
 from .client_h2 import WsOverH2Stream, bootstrap_ws_over_h2
 from .server_h2 import WsOverH2ServerStream, WsH2Handler
 from .auto_client import (

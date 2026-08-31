@@ -13,21 +13,38 @@ The upgrade handshake (§4.2):
 """
 
 from std.builtin.debug_assert import debug_assert
-from std.ffi import OwnedDLHandle, c_int
-from std.memory import UnsafePointer
+from std.atomic import Atomic, Ordering
+from std.ffi import ErrNo, OwnedDLHandle, c_int, get_errno
+from std.memory import ArcPointer, Pointer, UnsafePointer
+from std.memory.alloc import unsafe_alloc
 
+from ._duplex import _DuplexSync
+from ._subprotocol import (
+    _is_http_token,
+    _parse_subprotocol_offers,
+    _select_subprotocol,
+    _trim_http_ows,
+    _validate_subprotocols,
+)
 from .frame import WsFrame, WsOpcode, WsCloseCode, WsProtocolError
 from ..crypto.base64 import base64_encode as _b64_encode_srv
 from ..http.response import Status
 from ..tcp import TcpListener, TcpStream
 from ..net import SocketAddr, NetworkError, _find_flare_lib
+from ..net._libc import INVALID_FD, SHUT_RDWR, _shutdown
 from ..runtime._thread import ThreadHandle, _OpaquePtr
+from ..runtime.event import Event, INTEREST_READ
+from ..runtime.reactor import Reactor
 from ..runtime.reuseport import bind_reuseport
 from ..utils.dylib import dl_sym
 
 # RFC 6455 §1.3 magic GUID
 comptime _WS_GUID: String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 comptime _SHA1_LEN: Int = 20
+comptime _WS_LISTENER_TOKEN: UInt64 = 1
+comptime _WS_STOP_POLL_MS: Int = 100
+comptime _WS_ECONNABORTED_LINUX: Int = 103
+comptime _WS_ECONNABORTED_MACOS: Int = 53
 
 
 # ── SHA-1 helper (same approach as ws/client.mojo) ───────────────────────────
@@ -106,28 +123,16 @@ def _compute_accept_srv(key: String) raises -> String:
 # ── Handshake request reader ──────────────────────────────────────────────────
 
 
-def _read_line_srv(mut stream: TcpStream) raises -> String:
-    """Read one CRLF-terminated line from ``stream``.
-
-    Args:
-        stream: Open TCP stream.
-
-    Returns:
-        Line content without the terminator.
-    """
-    var line = String(capacity=256)
-    var buf = List[UInt8](capacity=1)
-    buf.append(UInt8(0))
-    while True:
-        var n = stream.read(buf.unsafe_ptr(), 1)
-        if n == 0:
-            return line^
-        var c = buf[0]
-        if c == 13:
-            continue
-        if c == 10:
-            return line^
-        line += chr(Int(c))
+def _upgrade_headers_complete(bytes: List[UInt8]) -> Bool:
+    """Return whether ``bytes`` ends at the HTTP header terminator."""
+    var size = len(bytes)
+    return (
+        size >= 4
+        and bytes[size - 4] == UInt8(13)
+        and bytes[size - 3] == UInt8(10)
+        and bytes[size - 2] == UInt8(13)
+        and bytes[size - 1] == UInt8(10)
+    )
 
 
 def _lower_srv(s: String) -> String:
@@ -254,17 +259,25 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> WsUpgradeRequest:
     """
     var pos = 0
 
-    def read_line(data: Span[UInt8, _], mut pos: Int) -> String:
+    def read_line(data: Span[UInt8, _], mut pos: Int) raises -> String:
         var line = String(capacity=256)
+        var saw_cr = False
         while pos < len(data):
             var c = data[pos]
             pos += 1
             if c == 13:
+                if saw_cr:
+                    raise NetworkError("bare CR in WebSocket Upgrade headers")
+                saw_cr = True
                 continue
             if c == 10:
+                if not saw_cr:
+                    raise NetworkError("bare LF in WebSocket Upgrade headers")
                 return line^
+            if saw_cr:
+                raise NetworkError("bare CR in WebSocket Upgrade headers")
             line += chr(Int(c))
-        return line^
+        raise NetworkError("truncated WebSocket Upgrade header line")
 
     var method: String
     var target: String
@@ -275,23 +288,25 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> WsUpgradeRequest:
     var header_values = List[String]()
     var found_upgrade = False
     var found_connection = False
-
     while True:
         var line = read_line(data, pos)
         if line.byte_length() == 0:
             break
-        var colon = _str_find_srv(line, ":")
-        if colon < 0:
-            continue
-        var k = _lower_srv(
-            String(
-                String(String(unsafe_from_utf8=line.as_bytes()[:colon])).strip()
+        if line.unsafe_ptr().unsafe_offset(0)[] == UInt8(
+            32
+        ) or line.unsafe_ptr().unsafe_offset(0)[] == UInt8(9):
+            raise NetworkError(
+                "folded WebSocket Upgrade headers are not accepted"
             )
-        )
-        var v = String(
-            String(
-                String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
-            ).strip()
+        var colon = _str_find_srv(line, ":")
+        if colon <= 0:
+            raise NetworkError("malformed WebSocket Upgrade header")
+        var field_name = String(unsafe_from_utf8=line.as_bytes()[:colon])
+        if not _is_http_token(field_name):
+            raise NetworkError("invalid WebSocket Upgrade header field name")
+        var k = _lower_srv(field_name)
+        var v = _trim_http_ows(
+            String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
         )
         header_names.append(k.copy())
         header_values.append(v.copy())
@@ -334,61 +349,47 @@ def _read_upgrade_request(mut stream: TcpStream) raises -> WsUpgradeRequest:
     Raises:
         NetworkError: If the upgrade request is malformed or missing the key.
     """
-    var method: String
-    var target: String
-    (method, target) = _parse_request_line(_read_line_srv(stream))
+    var request = List[UInt8](capacity=512)
+    var byte = List[UInt8](capacity=1)
+    byte.append(UInt8(0))
+    while not _upgrade_headers_complete(request):
+        var count = stream.read(byte.unsafe_ptr(), 1)
+        if count == 0:
+            raise NetworkError("truncated WebSocket Upgrade headers")
+        request.append(byte[0])
+    return _parse_ws_upgrade_bytes(Span[UInt8, _](request))
 
-    var ws_key = String("")
-    var header_names = List[String]()
-    var header_values = List[String]()
-    var found_upgrade = False
-    var found_connection = False
 
-    while True:
-        var line = _read_line_srv(stream)
-        if line.byte_length() == 0:
-            break
-        var colon = _str_find_srv(line, ":")
-        if colon < 0:
+def _offered_subprotocols(request: WsUpgradeRequest) raises -> List[String]:
+    """Parse all protocol offers from an Upgrade request in arrival order."""
+    var offered = List[String]()
+    var header_seen = False
+    for index in range(len(request.header_names)):
+        if request.header_names[index] != "sec-websocket-protocol":
             continue
-        var k = _lower_srv(
-            String(
-                String(String(unsafe_from_utf8=line.as_bytes()[:colon])).strip()
-            )
-        )
-        var v = String(
-            String(
-                String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
-            ).strip()
-        )
-        header_names.append(k.copy())
-        header_values.append(v.copy())
-        if k == "sec-websocket-key":
-            ws_key = v
-        elif k == "upgrade" and _lower_srv(v) == "websocket":
-            found_upgrade = True
-        elif k == "connection" and "upgrade" in _lower_srv(v):
-            found_connection = True
-
-    if not found_upgrade or not found_connection:
-        raise NetworkError(
-            "WebSocket upgrade request missing Upgrade: websocket or"
-            " Connection: Upgrade headers"
-        )
-    if ws_key.byte_length() == 0:
-        raise NetworkError(
-            "WebSocket upgrade request missing Sec-WebSocket-Key"
-        )
-    return WsUpgradeRequest(
-        method=method^,
-        target=target^,
-        key=ws_key^,
-        header_names=header_names^,
-        header_values=header_values^,
-    )
+        header_seen = True
+        var field = _parse_subprotocol_offers(request.header_values[index])
+        for protocol in field:
+            offered.append(protocol)
+    if header_seen and len(offered) == 0:
+        raise Error("WebSocket subprotocol offer contains no protocol token")
+    _validate_subprotocols(offered)
+    return offered^
 
 
-def _send_upgrade_response(mut stream: TcpStream, accept: String) raises:
+def _negotiate_subprotocol(
+    request: WsUpgradeRequest, supported: List[String]
+) raises -> Optional[String]:
+    """Choose the first server-preferred protocol offered by the peer."""
+    var offered = _offered_subprotocols(request)
+    return _select_subprotocol(offered, supported)
+
+
+def _send_upgrade_response(
+    mut stream: TcpStream,
+    accept: String,
+    subprotocol: Optional[String] = None,
+) raises:
     """Send the 101 Switching Protocols response.
 
     Args:
@@ -402,8 +403,10 @@ def _send_upgrade_response(mut stream: TcpStream, accept: String) raises:
         + "Sec-WebSocket-Accept: "
         + accept
         + "\r\n"
-        + "\r\n"
     )
+    if subprotocol:
+        resp += "Sec-WebSocket-Protocol: " + subprotocol.value() + "\r\n"
+    resp += "\r\n"
     var resp_bytes = resp.as_bytes()
     stream.write_all(Span[UInt8, _](resp_bytes))
 
@@ -438,20 +441,27 @@ struct WsConnection(Movable):
     var _stream: TcpStream
     var _peer: SocketAddr
     var _upgrade: WsUpgradeRequest
+    var _negotiated_subprotocol: Optional[String]
 
     def __init__(
         out self,
         var stream: TcpStream,
         peer: SocketAddr,
         var upgrade: WsUpgradeRequest,
+        var negotiated_subprotocol: Optional[String] = None,
     ):
         self._stream = stream^
         self._peer = peer
         self._upgrade = upgrade^
+        self._negotiated_subprotocol = negotiated_subprotocol^
 
     def upgrade_request(self) -> WsUpgradeRequest:
         """Return a copy of the parsed HTTP Upgrade request."""
         return self._upgrade.copy()
+
+    def negotiated_subprotocol(self) -> Optional[String]:
+        """Return the protocol selected during the opening handshake."""
+        return self._negotiated_subprotocol.copy()
 
     def __deinit__(deinit self):
         self._stream.close()
@@ -603,6 +613,193 @@ trait WsHandler(Copyable, Deinitable, Movable):
         ...
 
 
+@always_inline
+def _load_ws_server_stop(mut cell: UInt8) -> Bool:
+    return Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](
+        Pointer(to=cell).unsafe_bitcast[Scalar[DType.uint8]]()
+    ) != UInt8(0)
+
+
+@always_inline
+def _store_ws_server_stop(mut cell: UInt8):
+    Atomic[DType.uint8].store[ordering=Ordering.RELEASE](
+        Pointer(to=cell).unsafe_bitcast[Scalar[DType.uint8]](), UInt8(1)
+    )
+
+
+@always_inline
+def _ws_accept_error_is_retryable(error: ErrNo) -> Bool:
+    if (
+        error == ErrNo.EAGAIN
+        or error == ErrNo.EWOULDBLOCK
+        or error == ErrNo.EINTR
+    ):
+        return True
+    var code = Int(error.value)
+    return code == _WS_ECONNABORTED_LINUX or code == _WS_ECONNABORTED_MACOS
+
+
+struct _WsServerState(Movable):
+    """Shared stop authority and worker result for one stoppable server."""
+
+    var admission: _DuplexSync
+    var reactor: Reactor
+    var stop_requested: UInt8
+    var handshake_fd: c_int
+    var worker_error: String
+
+    def __init__(out self, var reactor: Reactor):
+        self.admission = _DuplexSync()
+        self.reactor = reactor^
+        self.stop_requested = UInt8(0)
+        self.handshake_fd = INVALID_FD
+        self.worker_error = ""
+
+    def is_stopping(mut self) -> Bool:
+        return _load_ws_server_stop(self.stop_requested)
+
+    def request_stop(mut self):
+        self.admission.lock()
+        if _load_ws_server_stop(self.stop_requested):
+            self.admission.unlock()
+            return
+        _store_ws_server_stop(self.stop_requested)
+        if self.handshake_fd != INVALID_FD:
+            _ = _shutdown(self.handshake_fd, SHUT_RDWR)
+        self.admission.unlock()
+        try:
+            self.reactor.wakeup()
+        except:
+            pass
+
+    def publish_handshake(mut self, fd: c_int) -> Bool:
+        """Publish a worker-owned handshake fd unless stop already won."""
+        self.admission.lock()
+        var publish = (
+            not _load_ws_server_stop(self.stop_requested)
+            and self.handshake_fd == INVALID_FD
+        )
+        if publish:
+            self.handshake_fd = fd
+        self.admission.unlock()
+        return publish
+
+    def clear_handshake(mut self, fd: c_int):
+        """Clear ``fd`` before its worker-owned stream can be destroyed."""
+        self.admission.lock()
+        if self.handshake_fd == fd:
+            self.handshake_fd = INVALID_FD
+        self.admission.unlock()
+
+    def has_active_handshake(mut self) -> Bool:
+        """Observe handshake publication under the admission mutex."""
+        self.admission.lock()
+        var active = self.handshake_fd != INVALID_FD
+        self.admission.unlock()
+        return active
+
+    def claim_handler_after_handshake(mut self, fd: c_int) -> Bool:
+        """Clear ``fd`` and linearize handler admission against stop."""
+        self.admission.lock()
+        var owns_handshake = self.handshake_fd == fd
+        if owns_handshake:
+            self.handshake_fd = INVALID_FD
+        var admitted = owns_handshake and not _load_ws_server_stop(
+            self.stop_requested
+        )
+        self.admission.unlock()
+        return admitted
+
+    def record_worker_error(mut self, message: String):
+        """Record the worker's first fatal loop failure."""
+        self.admission.lock()
+        if self.worker_error.byte_length() == 0:
+            self.worker_error = message
+        self.admission.unlock()
+
+    def raise_worker_error(mut self) raises:
+        """Surface a fatal poll or accept failure after the join barrier."""
+        self.admission.lock()
+        var message = self.worker_error.copy()
+        self.admission.unlock()
+        if message.byte_length() > 0:
+            raise Error("WebSocket server worker failed: " + message)
+
+
+struct WsServerStop(Movable):
+    """Independent, idempotent stop capability for a stoppable server."""
+
+    var _state: ArcPointer[_WsServerState]
+
+    def __init__(out self, state: ArcPointer[_WsServerState]):
+        self._state = state
+
+    def stop(mut self):
+        """Fence new connections and wake the server worker.
+
+        A connection already admitted to ``handler`` is allowed to finish.
+        Calling ``stop`` more than once is harmless.
+        """
+        self._state[].request_stop()
+
+
+@explicit_destroy(
+    "WsServerRuntime must be consumed with join() or stop_and_join()"
+)
+struct WsServerRuntime(Deinitable where False, Movable):
+    """Linear owner of a stoppable WebSocket server worker."""
+
+    var _state: ArcPointer[_WsServerState]
+    var _thread: ThreadHandle
+    var _stop_taken: Bool
+
+    def __init__(
+        out self,
+        state: ArcPointer[_WsServerState],
+        var thread: ThreadHandle,
+    ):
+        self._state = state
+        self._thread = thread^
+        self._stop_taken = False
+
+    def take_stop(mut self) raises -> WsServerStop:
+        """Take the independent stop capability exactly once.
+
+        :returns: A stop handle that may be used from another thread.
+        :raises Error: If the stop capability was already taken.
+        """
+        if self._stop_taken:
+            raise Error("WsServerRuntime stop already taken")
+        self._stop_taken = True
+        return WsServerStop(self._state)
+
+    def join(deinit self) raises:
+        """Join the worker and surface a fatal loop failure.
+
+        Per-connection upgrade and handler errors stay isolated to their
+        connection. A fatal reactor or accept-loop error is raised after the
+        thread has acknowledged exit.
+        """
+        self._thread.join()
+        self._state[].raise_worker_error()
+
+    def stop_and_join(deinit self) raises:
+        """Request stop, drain any active handler, and join the worker."""
+        self._state[].request_stop()
+        self._thread.join()
+        self._state[].raise_worker_error()
+
+
+@fieldwise_init
+struct _WsThinHandler(Copyable, Movable, WsHandler):
+    """Adapt the compatibility thin callback to :trait:`WsHandler`."""
+
+    var handler: def(mut WsConnection) raises thin -> None
+
+    def on_connection(mut self, mut conn: WsConnection) raises:
+        self.handler(conn)
+
+
 struct WsServer(Movable):
     """A WebSocket server that upgrades incoming HTTP connections.
 
@@ -613,6 +810,7 @@ struct WsServer(Movable):
 
     Fields:
         _listener: The bound TCP listener.
+        _subprotocols: Supported protocols in server preference order.
 
     Example:
         ```mojo
@@ -629,19 +827,31 @@ struct WsServer(Movable):
     """
 
     var _listener: TcpListener
+    var _subprotocols: List[String]
 
-    def __init__(out self, var listener: TcpListener):
+    def __init__(
+        out self,
+        var listener: TcpListener,
+        subprotocols: List[String] = [],
+    ) raises:
+        _validate_subprotocols(subprotocols)
         self._listener = listener^
+        self._subprotocols = subprotocols.copy()
 
     def __deinit__(deinit self):
         self._listener.close()
 
     @staticmethod
-    def bind(addr: SocketAddr) raises -> WsServer:
+    def bind(
+        addr: SocketAddr, subprotocols: List[String] = []
+    ) raises -> WsServer:
         """Bind a WebSocket server on ``addr``.
 
         Args:
             addr: Local address to accept connections on.
+            subprotocols: Supported protocol tokens in server preference
+                order. The first supported value offered by a client is
+                selected.
 
         Returns:
             A ``WsServer`` ready to call ``serve()``.
@@ -650,8 +860,9 @@ struct WsServer(Movable):
             AddressInUse: If the port is already bound.
             NetworkError: For any other OS error.
         """
+        _validate_subprotocols(subprotocols)
         var listener = TcpListener.bind(addr)
-        return WsServer(listener^)
+        return WsServer(listener^, subprotocols)
 
     def serve(self, handler: def(mut WsConnection) raises thin -> None) raises:
         """Accept WebSocket connections in a single-threaded loop.
@@ -677,7 +888,7 @@ struct WsServer(Movable):
         while True:
             var stream = self._listener.accept()
             var peer = stream.peer_addr()
-            _handle_ws_connection(stream^, peer, handler)
+            _handle_ws_connection(stream^, peer, handler, self._subprotocols)
 
     def serve(
         mut self,
@@ -728,7 +939,7 @@ struct WsServer(Movable):
         # silently swallow connections we never serve. The
         # SO_REUSEPORT listeners below take over the port.
         self._listener.close()
-        _ws_serve_multicore(addr, handler, num_workers)
+        _ws_serve_multicore(addr, handler, num_workers, self._subprotocols)
 
     def serve[H: WsHandler](mut self, var handler: H) raises:
         """Accept WebSocket connections, dispatching each to a stateful
@@ -748,13 +959,52 @@ struct WsServer(Movable):
             var stream = self._listener.accept()
             var peer = stream.peer_addr()
             try:
-                var key = _read_upgrade_request(stream)
-                var accept = _compute_accept_srv(key)
-                _send_upgrade_response(stream, accept)
-                var conn = WsConnection(stream^, peer)
+                var conn = _upgrade_ws_connection(
+                    stream^, peer, self._subprotocols
+                )
                 handler.on_connection(conn)
             except e:
                 print("[ws] connection error: " + String(e))
+
+    def serve_stoppable[
+        H: WsHandler
+    ](deinit self, var handler: H) raises -> WsServerRuntime:
+        """Move this server into a joinable background worker.
+
+        ``WsServerStop.stop`` is an admission fence. It wakes an idle worker
+        immediately and prevents another connection from reaching ``handler``.
+        If handler admission already won, the worker lets that invocation
+        finish before exiting, and ``join`` waits for that drain.
+        Multicore serving remains a separate, non-stoppable API.
+
+        :param handler: Stateful handler owned by the worker for its lifetime.
+        :returns: A linear runtime that must be consumed by ``join`` or
+            ``stop_and_join``.
+        :raises Error: If the worker thread cannot be spawned.
+        :raises NetworkError: If the listener cannot be registered with the
+            worker reactor.
+        """
+        return _ws_serve_stoppable(
+            self._listener^,
+            self._subprotocols^,
+            handler^,
+        )
+
+    def serve_stoppable(
+        deinit self,
+        handler: def(mut WsConnection) raises thin -> None,
+    ) raises -> WsServerRuntime:
+        """Move this server into a stoppable worker using a thin callback.
+
+        :param handler: Thin per-connection callback.
+        :returns: A linear stoppable runtime.
+        """
+        var adapted = _WsThinHandler(handler)
+        return _ws_serve_stoppable(
+            self._listener^,
+            self._subprotocols^,
+            adapted^,
+        )
 
     def local_addr(self) -> SocketAddr:
         """Return the local address the server is bound to.
@@ -769,23 +1019,229 @@ struct WsServer(Movable):
         self._listener.close()
 
 
+@fieldwise_init
+struct _WsUpgradeResult(Movable):
+    """Successful opening-handshake data while the stream stays borrowed."""
+
+    var request: WsUpgradeRequest
+    var subprotocol: Optional[String]
+
+    def into_connection(
+        deinit self, var stream: TcpStream, peer: SocketAddr
+    ) -> WsConnection:
+        """Move this result and its stream into a server connection."""
+        return WsConnection(
+            stream^,
+            peer,
+            self.request^,
+            self.subprotocol^,
+        )
+
+
+def _send_bad_upgrade_response(mut stream: TcpStream):
+    """Best-effort HTTP rejection before any WebSocket response is sent."""
+    var response = (
+        "HTTP/1.1 400 Bad Request\r\n"
+        + "Connection: close\r\n"
+        + "Content-Length: 0\r\n"
+        + "\r\n"
+    )
+    try:
+        stream.write_all(Span[UInt8, _](response.as_bytes()))
+    except:
+        pass
+
+
+def _perform_ws_upgrade(
+    mut stream: TcpStream,
+    subprotocols: List[String] = [],
+) raises -> _WsUpgradeResult:
+    """Complete the shared handshake while leaving stream ownership outside."""
+    var request: WsUpgradeRequest
+    try:
+        request = _read_upgrade_request(stream)
+    except error:
+        _send_bad_upgrade_response(stream)
+        raise error^
+
+    var subprotocol: Optional[String]
+    try:
+        subprotocol = _negotiate_subprotocol(request, subprotocols)
+    except error:
+        _send_bad_upgrade_response(stream)
+        raise error^
+
+    var accept = _compute_accept_srv(request.key)
+    _send_upgrade_response(stream, accept, subprotocol)
+    return _WsUpgradeResult(request^, subprotocol^)
+
+
+def _upgrade_ws_connection(
+    var stream: TcpStream,
+    peer: SocketAddr,
+    subprotocols: List[String] = [],
+) raises -> WsConnection:
+    """Upgrade one accepted TCP stream with the shared negotiation path."""
+    var result = _perform_ws_upgrade(stream, subprotocols)
+    return result^.into_connection(stream^, peer)
+
+
 def _handle_ws_connection(
     var stream: TcpStream,
     peer: SocketAddr,
     handler: def(mut WsConnection) raises thin -> None,
+    subprotocols: List[String] = [],
 ):
     """Perform the WebSocket handshake and call handler.
 
     Upgrade errors are swallowed so the accept loop continues.
     """
     try:
-        var req = _read_upgrade_request(stream)
-        var accept = _compute_accept_srv(req.key)
-        _send_upgrade_response(stream, accept)
-        var conn = WsConnection(stream^, peer, req^)
+        var conn = _upgrade_ws_connection(stream^, peer, subprotocols)
         handler(conn)
     except e:
         print("[ws] connection error: " + String(e))
+
+
+struct _WsStoppableCtx[H: WsHandler](Movable):
+    """Heap-owned listener, negotiation data, handler, and worker state."""
+
+    var listener: TcpListener
+    var subprotocols: List[String]
+    var handler: Self.H
+    var state: ArcPointer[_WsServerState]
+
+    def __init__(
+        out self,
+        var listener: TcpListener,
+        var subprotocols: List[String],
+        var handler: Self.H,
+        state: ArcPointer[_WsServerState],
+    ):
+        self.listener = listener^
+        self.subprotocols = subprotocols^
+        self.handler = handler^
+        self.state = state
+
+
+def _ws_stoppable_accept_loop[
+    H: WsHandler
+](mut context: _WsStoppableCtx[H]) raises:
+    """Run one reactor-backed accept loop until its stop fence wins."""
+    var events = List[Event]()
+    while True:
+        if context.state[].is_stopping():
+            return
+
+        # Reconcile periodically because Reactor wake writes may be interrupted.
+        var event_count = context.state[].reactor.poll(_WS_STOP_POLL_MS, events)
+        if context.state[].is_stopping():
+            return
+
+        for index in range(event_count):
+            if context.state[].is_stopping():
+                return
+
+            var event = events[index]
+            if event.is_wakeup() or event.token != _WS_LISTENER_TOKEN:
+                continue
+
+            if context.state[].is_stopping():
+                return
+            var stream: TcpStream
+            try:
+                stream = context.listener.accept()
+            except error:
+                var accept_error = get_errno()
+                if context.state[].is_stopping():
+                    return
+                if _ws_accept_error_is_retryable(accept_error):
+                    continue
+                raise error^
+            stream._socket.set_nonblocking(False)
+            var handshake_fd = stream._socket.fd
+            if not context.state[].publish_handshake(handshake_fd):
+                return
+
+            var peer = stream.peer_addr()
+            var upgrade: _WsUpgradeResult
+            try:
+                upgrade = _perform_ws_upgrade(stream, context.subprotocols)
+            except error:
+                context.state[].clear_handshake(handshake_fd)
+                if context.state[].is_stopping():
+                    return
+                print("[ws] connection error: " + String(error))
+                continue
+
+            if not context.state[].claim_handler_after_handshake(handshake_fd):
+                return
+            var conn = upgrade^.into_connection(stream^, peer)
+            try:
+                context.handler.on_connection(conn)
+            except error:
+                if context.state[].is_stopping():
+                    return
+                print("[ws] connection error: " + String(error))
+
+
+def _ws_stoppable_worker_entry[H: WsHandler](arg: _OpaquePtr) -> _OpaquePtr:
+    """Run and reclaim one stoppable worker context on every exit path."""
+    var context_address = Int(arg)
+    debug_assert[assert_mode="safe"](
+        context_address != 0,
+        "_ws_stoppable_worker_entry: context pointer must be non-NULL",
+    )
+    var raw = UnsafePointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=context_address
+    )
+    var context = raw.unsafe_bitcast[_WsStoppableCtx[H]]()
+    try:
+        _ws_stoppable_accept_loop(context[])
+    except error:
+        context[].state[].record_worker_error(String(error))
+    context.unsafe_deinit_pointee()
+    context.unsafe_free()
+
+    var null_address = 0
+    return _OpaquePtr(unsafe_from_address=null_address)
+
+
+def _ws_serve_stoppable[
+    H: WsHandler
+](
+    var listener: TcpListener,
+    var subprotocols: List[String],
+    var handler: H,
+) raises -> WsServerRuntime:
+    """Spawn a stoppable worker after registering its listener fd."""
+    listener._socket.set_nonblocking(True)
+    var reactor = Reactor()
+    reactor.register(listener.as_raw_fd(), _WS_LISTENER_TOKEN, INTEREST_READ)
+    var state = ArcPointer[_WsServerState](_WsServerState(reactor^))
+
+    var context = unsafe_alloc[_WsStoppableCtx[H]](1)
+    debug_assert[assert_mode="safe"](
+        Int(context) != 0,
+        "_ws_serve_stoppable: context allocation returned NULL",
+    )
+    context.unsafe_write(
+        _WsStoppableCtx[H](
+            listener^,
+            subprotocols^,
+            handler^,
+            state,
+        )
+    )
+    var arg = _OpaquePtr(unsafe_from_address=Int(context))
+    var thread: ThreadHandle
+    try:
+        thread = ThreadHandle.spawn[_ws_stoppable_worker_entry[H]](arg)
+    except error:
+        context.unsafe_deinit_pointee()
+        context.unsafe_free()
+        raise error^
+    return WsServerRuntime(state, thread^)
 
 
 # ── Multi-worker WsServer ──────────────────────────────────────────────────
@@ -806,6 +1262,7 @@ struct _WsWorkerCtx(Movable):
 
     var listener: TcpListener
     var handler: def(mut WsConnection) raises thin -> None
+    var subprotocols: List[String]
 
 
 def _ws_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
@@ -832,7 +1289,12 @@ def _ws_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
         while True:
             var stream = ctx_ptr[].listener.accept()
             var peer = stream.peer_addr()
-            _handle_ws_connection(stream^, peer, ctx_ptr[].handler)
+            _handle_ws_connection(
+                stream^,
+                peer,
+                ctx_ptr[].handler,
+                ctx_ptr[].subprotocols,
+            )
     except:
         pass
     # UnsafePointer is non-nullable; build C NULL from a runtime 0.
@@ -846,6 +1308,7 @@ def _ws_serve_multicore(
     addr: SocketAddr,
     handler: def(mut WsConnection) raises thin -> None,
     num_workers: Int,
+    subprotocols: List[String] = [],
 ) raises:
     """Spawn ``num_workers`` WebSocket worker threads sharing a port.
 
@@ -887,7 +1350,7 @@ def _ws_serve_multicore(
 
     for i in range(num_workers):
         var listener = bind_reuseport(addr)
-        var ctx = _WsWorkerCtx(listener^, handler)
+        var ctx = _WsWorkerCtx(listener^, handler, subprotocols.copy())
         var ctx_ptr = alloc[_WsWorkerCtx](1)
         debug_assert[assert_mode="safe"](
             Int(ctx_ptr) != 0,

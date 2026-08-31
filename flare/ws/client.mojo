@@ -31,6 +31,13 @@ from ._duplex import (
     _split_stream,
 )
 from ._message import WsMessage
+from ._subprotocol import (
+    _contains_subprotocol,
+    _is_http_token,
+    _parse_subprotocol_selection,
+    _render_subprotocols,
+    _trim_http_ows,
+)
 from ._transport import _WsStream
 from .frame import WsFrame, WsOpcode, _encode_client_frame
 from ..crypto.base64 import base64_encode as _base64_encode
@@ -239,6 +246,33 @@ def _lower_local(s: String) -> String:
         else:
             out += chr(Int(c))
     return out^
+
+
+def _client_subprotocol_offer(
+    extra_headers: List[String], subprotocols: List[String]
+) raises -> String:
+    """Validate and render the client's first-class protocol offer.
+
+    ``Sec-WebSocket-Protocol`` is owned by the typed argument so response
+    validation cannot be bypassed through an untracked raw header.
+    """
+    for header in extra_headers:
+        var colon = _str_find_local(header, ":")
+        if colon <= 0:
+            raise WsHandshakeError("malformed extra HTTP header")
+        var field_name = String(unsafe_from_utf8=header.as_bytes()[:colon])
+        if not _is_http_token(field_name):
+            raise WsHandshakeError("invalid extra HTTP header field name")
+        var name = _lower_local(field_name)
+        if name == "sec-websocket-protocol":
+            raise WsHandshakeError(
+                "Sec-WebSocket-Protocol must be supplied through the"
+                " subprotocols argument"
+            )
+    try:
+        return _render_subprotocols(subprotocols)
+    except error:
+        raise WsHandshakeError(String(error))
 
 
 def _cancel_resolve_address(address: Int):
@@ -513,19 +547,23 @@ def _headers_complete(bytes: List[UInt8]) -> Bool:
 
 
 def _validate_upgrade_response(
-    bytes: List[UInt8], expected_accept: String
-) raises:
+    bytes: List[UInt8],
+    expected_accept: String,
+    offered_subprotocols: List[String] = [],
+) raises -> Optional[String]:
     var response = String(unsafe_from_utf8=Span[UInt8, _](bytes))
     var line_end = _str_find_from_local(response, "\r\n", 0)
     if line_end < 0:
         raise WsHandshakeError("truncated HTTP Upgrade response")
     var status_line = String(unsafe_from_utf8=response.as_bytes()[:line_end])
+    if "\r" in status_line or "\n" in status_line:
+        raise WsHandshakeError("invalid HTTP Upgrade response line ending")
     if not status_line.startswith("HTTP/1.1 101"):
         raise WsHandshakeError(
             "Expected 101 Switching Protocols, got: " + status_line
         )
 
-    var accept_header = String("")
+    var header_lines = List[String]()
     var line_start = line_end + 2
     while line_start < response.byte_length():
         line_end = _str_find_from_local(response, "\r\n", line_start)
@@ -536,18 +574,59 @@ def _validate_upgrade_response(
         var line = String(
             unsafe_from_utf8=response.as_bytes()[line_start:line_end]
         )
-        var colon = _str_find_local(line, ":")
-        if colon >= 0:
-            var name = _lower_local(
-                String(String(unsafe_from_utf8=line.as_bytes()[:colon]).strip())
-            )
-            if name == "sec-websocket-accept":
-                accept_header = String(
-                    String(
-                        unsafe_from_utf8=line.as_bytes()[colon + 1 :]
-                    ).strip()
+        if "\r" in line or "\n" in line:
+            raise WsHandshakeError("invalid HTTP Upgrade response line ending")
+        if line.byte_length() > 0 and (
+            line.unsafe_ptr().unsafe_offset(0)[] == UInt8(32)
+            or line.unsafe_ptr().unsafe_offset(0)[] == UInt8(9)
+        ):
+            if len(header_lines) == 0:
+                raise WsHandshakeError(
+                    "HTTP Upgrade response starts with a folded header"
                 )
+            var previous_index = len(header_lines) - 1
+            var unfolded = (
+                header_lines[previous_index] + " " + _trim_http_ows(line)
+            )
+            header_lines[previous_index] = unfolded^
+            line_start = line_end + 2
+            continue
+        header_lines.append(line^)
         line_start = line_end + 2
+
+    var accept_header = String("")
+    var selected_subprotocol = Optional[String]()
+    var subprotocol_header_count = 0
+    for line in header_lines:
+        var colon = _str_find_local(line, ":")
+        if colon <= 0:
+            raise WsHandshakeError("malformed HTTP Upgrade response header")
+        var field_name = String(unsafe_from_utf8=line.as_bytes()[:colon])
+        if not _is_http_token(field_name):
+            raise WsHandshakeError(
+                "invalid HTTP Upgrade response header field name"
+            )
+        var name = _lower_local(field_name)
+        if name == "sec-websocket-accept":
+            accept_header = _trim_http_ows(
+                String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
+            )
+        elif name == "sec-websocket-protocol":
+            subprotocol_header_count += 1
+            if subprotocol_header_count > 1:
+                raise WsHandshakeError(
+                    "server returned multiple Sec-WebSocket-Protocol headers"
+                )
+            var header_value = _trim_http_ows(
+                String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
+            )
+            try:
+                var selected = _parse_subprotocol_selection(header_value)
+                selected_subprotocol = Optional[String](selected^)
+            except:
+                raise WsHandshakeError(
+                    "invalid Sec-WebSocket-Protocol response"
+                )
 
     if accept_header != expected_accept:
         raise WsHandshakeError(
@@ -558,14 +637,28 @@ def _validate_upgrade_response(
             + "'"
         )
 
+    if selected_subprotocol:
+        if len(offered_subprotocols) == 0:
+            raise WsHandshakeError(
+                "server selected a WebSocket subprotocol when none was offered"
+            )
+        if not _contains_subprotocol(
+            offered_subprotocols, selected_subprotocol.value()
+        ):
+            raise WsHandshakeError(
+                "server selected an unoffered WebSocket subprotocol"
+            )
+    return selected_subprotocol^
+
 
 def _drive_upgrade(
     control: ArcPointer[_WsControl],
     mut stream: _WsStream,
     request: String,
     expected_accept: String,
+    offered_subprotocols: List[String],
     deadline_ns: Int64,
-) raises:
+) raises -> Optional[String]:
     var request_bytes = List[UInt8](request.as_bytes())
     var offset = 0
     while offset < len(request_bytes):
@@ -603,7 +696,9 @@ def _drive_upgrade(
         )
         _wait_connect_fd(control, stream.fd(), interest, deadline_ns)
 
-    _validate_upgrade_response(response, expected_accept)
+    return _validate_upgrade_response(
+        response, expected_accept, offered_subprotocols
+    )
 
 
 def _close_stream_owner(control: ArcPointer[_WsControl], mut stream: _WsStream):
@@ -646,6 +741,7 @@ def _connect_with_control(
     url: String,
     config: TlsConfig,
     extra_headers: List[String],
+    subprotocols: List[String],
     deadline_ns: Int64,
     control: ArcPointer[_WsControl],
 ) raises -> WsClient:
@@ -655,6 +751,9 @@ def _connect_with_control(
     var parsed = Url.parse(http_url)
     var key = _generate_ws_key()
     var expected_accept = _compute_accept(key)
+    var subprotocol_offer = _client_subprotocol_offer(
+        extra_headers, subprotocols
+    )
     var tls_config = config.copy()
     if parsed.is_tls() and len(tls_config.alpn) == 0:
         tls_config.alpn = ["http/1.1"]
@@ -679,6 +778,8 @@ def _connect_with_control(
         + "\r\n"
         + "Sec-WebSocket-Version: 13\r\n"
     )
+    if subprotocol_offer.byte_length() > 0:
+        request += "Sec-WebSocket-Protocol: " + subprotocol_offer + "\r\n"
     for i in range(len(extra_headers)):
         if "\r" in extra_headers[i] or "\n" in extra_headers[i]:
             raise WsHandshakeError(
@@ -729,8 +830,16 @@ def _connect_with_control(
     else:
         stream = _WsStream(tcp^)
 
+    var negotiated_subprotocol: Optional[String]
     try:
-        _drive_upgrade(control, stream, request, expected_accept, deadline_ns)
+        negotiated_subprotocol = _drive_upgrade(
+            control,
+            stream,
+            request,
+            expected_accept,
+            subprotocols,
+            deadline_ns,
+        )
         stream.set_connect_nonblocking(False)
         _check_connect_running(control, deadline_ns)
         control[].reactor.unregister(stream.fd())
@@ -744,7 +853,7 @@ def _connect_with_control(
             raise _control_error(control)
         raise error^
 
-    return WsClient(stream^, key^, control)
+    return WsClient(stream^, key^, control, negotiated_subprotocol^)
 
 
 struct WsConnectAttempt(Movable):
@@ -753,6 +862,7 @@ struct WsConnectAttempt(Movable):
     var _url: String
     var _config: TlsConfig
     var _extra_headers: List[String]
+    var _subprotocols: List[String]
     var _deadline_ns: Int64
     var _control: ArcPointer[_WsControl]
     var _shutdown_taken: Bool
@@ -762,12 +872,14 @@ struct WsConnectAttempt(Movable):
         url: String,
         config: TlsConfig,
         extra_headers: List[String],
+        subprotocols: List[String],
         deadline_ns: Int64,
         control: ArcPointer[_WsControl],
     ):
         self._url = url
         self._config = config.copy()
         self._extra_headers = extra_headers.copy()
+        self._subprotocols = subprotocols.copy()
         self._deadline_ns = deadline_ns
         self._control = control
         self._shutdown_taken = False
@@ -789,6 +901,7 @@ struct WsConnectAttempt(Movable):
                 self._url,
                 self._config,
                 self._extra_headers,
+                self._subprotocols,
                 self._deadline_ns,
                 self._control,
             )
@@ -824,16 +937,19 @@ struct WsClient(Movable):
     var _stream: _WsStream
     var _key: String
     var _control: ArcPointer[_WsControl]
+    var _negotiated_subprotocol: Optional[String]
 
     def __init__(
         out self,
         var stream: _WsStream,
         key: String,
         control: ArcPointer[_WsControl],
+        var negotiated_subprotocol: Optional[String] = None,
     ):
         self._stream = stream^
         self._key = key
         self._control = control
+        self._negotiated_subprotocol = negotiated_subprotocol^
 
     def __deinit__(deinit self):
         _close_stream_owner(self._control, self._stream)
@@ -851,13 +967,20 @@ struct WsClient(Movable):
         while sends are in flight. No internal thread is created.
         """
         _ = self._key^
+        _ = self._negotiated_subprotocol^
         return _split_stream(self._stream^, self._control)
+
+    def negotiated_subprotocol(self) -> Optional[String]:
+        """Return the server-selected protocol, if negotiation occurred."""
+        return self._negotiated_subprotocol.copy()
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def connect(
-        url: String, extra_headers: List[String] = []
+        url: String,
+        extra_headers: List[String] = [],
+        subprotocols: List[String] = [],
     ) raises -> WsClient:
         """Connect to a WebSocket server using default TLS configuration.
 
@@ -865,6 +988,10 @@ struct WsClient(Movable):
 
         Args:
             url: WebSocket URL (``ws://`` or ``wss://``).
+            extra_headers: Additional HTTP header lines. Protocol offers must
+                use ``subprotocols`` instead.
+            subprotocols: Ordered protocol tokens to offer. Any server
+                selection must be one of these values.
 
         Returns:
             A ``WsClient`` with the handshake complete.
@@ -877,6 +1004,7 @@ struct WsClient(Movable):
             url,
             _LEGACY_HANDSHAKE_TIMEOUT_MS,
             extra_headers=extra_headers,
+            subprotocols=subprotocols,
         )
         return attempt^.connect()
 
@@ -885,6 +1013,7 @@ struct WsClient(Movable):
         url: String,
         config: TlsConfig,
         extra_headers: List[String] = [],
+        subprotocols: List[String] = [],
     ) raises -> WsClient:
         """Connect to a WebSocket server with custom TLS configuration.
 
@@ -893,6 +1022,10 @@ struct WsClient(Movable):
         Args:
             url: WebSocket URL (``ws://`` or ``wss://``).
             config: TLS configuration (only used for ``wss://``).
+            extra_headers: Additional HTTP header lines. Protocol offers must
+                use ``subprotocols`` instead.
+            subprotocols: Ordered protocol tokens to offer. Any server
+                selection must be one of these values.
 
         Returns:
             A ``WsClient`` with the handshake complete.
@@ -907,6 +1040,7 @@ struct WsClient(Movable):
             config,
             _LEGACY_HANDSHAKE_TIMEOUT_MS,
             extra_headers=extra_headers,
+            subprotocols=subprotocols,
         )
         return attempt^.connect()
 
@@ -915,19 +1049,25 @@ struct WsClient(Movable):
         url: String,
         handshake_timeout_ms: Int,
         extra_headers: List[String] = [],
+        subprotocols: List[String] = [],
     ) raises -> WsConnectAttempt:
         """Create a cancellable attempt using default TLS configuration.
 
         ``handshake_timeout_ms`` is required, positive, and covers one
         absolute DNS-through-Upgrade interval. No network operation starts
         until :meth:`WsConnectAttempt.connect` is called.
+
+        ``subprotocols`` is a typed, token-validated offer; supplying the
+        corresponding raw header through ``extra_headers`` is rejected.
         """
         var deadline_ns = _opening_deadline_ns(handshake_timeout_ms)
+        _ = _client_subprotocol_offer(extra_headers, subprotocols)
         var control = ArcPointer[_WsControl](_WsControl())
         return WsConnectAttempt(
             url,
             TlsConfig(),
             extra_headers,
+            subprotocols,
             deadline_ns,
             control,
         )
@@ -938,19 +1078,25 @@ struct WsClient(Movable):
         config: TlsConfig,
         handshake_timeout_ms: Int,
         extra_headers: List[String] = [],
+        subprotocols: List[String] = [],
     ) raises -> WsConnectAttempt:
         """Create a cancellable attempt using a custom TLS configuration.
 
         ``handshake_timeout_ms`` is required, positive, and covers one
         absolute DNS-through-Upgrade interval. No network operation starts
         until :meth:`WsConnectAttempt.connect` is called.
+
+        ``subprotocols`` is a typed, token-validated offer; supplying the
+        corresponding raw header through ``extra_headers`` is rejected.
         """
         var deadline_ns = _opening_deadline_ns(handshake_timeout_ms)
+        _ = _client_subprotocol_offer(extra_headers, subprotocols)
         var control = ArcPointer[_WsControl](_WsControl())
         return WsConnectAttempt(
             url,
             config,
             extra_headers,
+            subprotocols,
             deadline_ns,
             control,
         )

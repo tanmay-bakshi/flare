@@ -266,6 +266,19 @@ def _classify_send_wake(
     return _SEND_WAKE_WAITING
 
 
+def _send_deadline_ns(timeout_ms: Int) raises -> Int64:
+    """Convert one public send timeout into this module's clock domain."""
+    if timeout_ms <= 0:
+        raise Error("WebSocket send timeout_ms must be positive")
+    if timeout_ms > Int(Int64.MAX // 1_000_000):
+        raise Error("WebSocket send timeout_ms is too large")
+    var now_ns = monotonic_now_ns()
+    var timeout_ns = Int64(timeout_ms) * 1_000_000
+    if now_ns > Int64.MAX - timeout_ns:
+        raise Error("WebSocket send deadline overflows Int64")
+    return now_ns + timeout_ns
+
+
 struct _WsControl(Movable):
     """Connection-wide cancellation authority from dial through duplex I/O.
 
@@ -600,38 +613,39 @@ struct WsSender(Movable):
         """Send one masked UTF-8 text frame."""
         self.send_frame(WsFrame.text(message))
 
-    def send_text_until(
-        mut self, message: String, deadline_ns: Int64
+    def send_text_within(
+        mut self, message: String, timeout_ms: Int
     ) raises -> Bool:
-        """Send text through an absolute monotonic publication deadline."""
-        return self.send_frame_until(WsFrame.text(message), deadline_ns)
+        """Send text within a positive millisecond publication timeout."""
+        return self.send_frame_within(WsFrame.text(message), timeout_ms)
 
     def send_binary(mut self, data: List[UInt8]) raises:
         """Send one masked binary frame."""
         self.send_frame(WsFrame.binary(data))
 
-    def send_binary_until(
-        mut self, data: List[UInt8], deadline_ns: Int64
+    def send_binary_within(
+        mut self, data: List[UInt8], timeout_ms: Int
     ) raises -> Bool:
-        """Send binary data through a monotonic publication deadline."""
-        return self.send_frame_until(WsFrame.binary(data), deadline_ns)
+        """Send binary data within a positive millisecond timeout."""
+        return self.send_frame_within(WsFrame.binary(data), timeout_ms)
 
     def send_frame(mut self, frame: WsFrame) raises:
         """Send one frame through the receiver-owned stream."""
         var wire = _encode_client_frame(frame)
         self._shared[].send(wire^)
 
-    def send_frame_until(
-        mut self, frame: WsFrame, deadline_ns: Int64
+    def send_frame_within(
+        mut self, frame: WsFrame, timeout_ms: Int
     ) raises -> Bool:
-        """Send one frame through an absolute monotonic deadline.
+        """Send one frame within a positive millisecond timeout.
 
         Returns ``True`` only when full publication is observed under the
         duplex mutex. ``False`` means publication was not observed when the
-        deadline won. The command may finish racing that observation, so the
-        caller MUST immediately shut down the connection after ``False`` and
-        must never attempt another send.
+        internally computed deadline won. The command may finish racing that
+        observation, so the caller MUST immediately shut down the connection
+        after ``False`` and must never attempt another send.
         """
+        var deadline_ns = _send_deadline_ns(timeout_ms)
         var wire = _encode_client_frame(frame)
         return self._shared[].send_until(wire^, deadline_ns)
 

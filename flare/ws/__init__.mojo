@@ -23,8 +23,8 @@ from flare.ws import (
   absolute handshake deadline and a shutdown handle available before dialing.
 - `WsDuplex` — Linear carrier returned by `WsClient.split()` for one sender
   thread, one receiver thread, and an independent shutdown owner.
-- `WsSender.send_*_until` — deadline-aware duplex publication against an
-  absolute monotonic timestamp. A `False` result requires immediate shutdown.
+- `WsSender.send_*_within` — duplex publication within a positive millisecond
+  timeout. A `False` result requires immediate shutdown.
 - `WsServer` — WebSocket server: upgrades HTTP connections and selects the
   first server-preferred subprotocol offered by each client. Its consuming
   `serve_stoppable` path returns a linear `WsServerRuntime` and an independent

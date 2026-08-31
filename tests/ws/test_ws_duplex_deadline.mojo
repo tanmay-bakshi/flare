@@ -1,7 +1,7 @@
-"""Focused publication-deadline tests for the duplex WebSocket sender."""
+"""Focused publication-timeout tests for the duplex WebSocket sender."""
 
 from std.memory.alloc import unsafe_alloc
-from std.testing import assert_equal, assert_false, assert_true
+from std.testing import assert_equal, assert_false, assert_raises, assert_true
 
 from flare.net import SocketAddr
 from flare.runtime._libc_time import monotonic_now_ns
@@ -40,7 +40,7 @@ struct _ReceiverContext(Movable):
 struct _TimedSenderContext(Movable):
     var sender: WsSender
     var payload: List[UInt8]
-    var deadline_ns: Int64
+    var timeout_ms: Int
     var published: Bool
     var error_message: String
 
@@ -48,11 +48,11 @@ struct _TimedSenderContext(Movable):
         out self,
         var sender: WsSender,
         var payload: List[UInt8],
-        deadline_ns: Int64,
+        timeout_ms: Int,
     ):
         self.sender = sender^
         self.payload = payload^
-        self.deadline_ns = deadline_ns
+        self.timeout_ms = timeout_ms
         self.published = False
         self.error_message = ""
 
@@ -69,21 +69,21 @@ def _receiver_thread(argument: _OpaquePtr) -> _OpaquePtr:
 def _timed_sender_thread(argument: _OpaquePtr) -> _OpaquePtr:
     var context = argument.unsafe_bitcast[_TimedSenderContext]()
     try:
-        context[].published = context[].sender.send_binary_until(
-            context[].payload, context[].deadline_ns
+        context[].published = context[].sender.send_binary_within(
+            context[].payload, context[].timeout_ms
         )
     except error:
         context[].error_message = String(error)
     return _null_opaque_pointer()
 
 
-def _compile_public_deadline_surface(
-    mut sender: WsSender, deadline_ns: Int64
+def _compile_public_duration_surface(
+    mut sender: WsSender, timeout_ms: Int
 ) raises:
-    """Keep all three additive public overloads type-checked."""
-    _ = sender.send_text_until("text", deadline_ns)
-    _ = sender.send_binary_until([UInt8(1)], deadline_ns)
-    _ = sender.send_frame_until(WsFrame.ping(), deadline_ns)
+    """Keep all three duration-based public methods type-checked."""
+    _ = sender.send_text_within("text", timeout_ms)
+    _ = sender.send_binary_within([UInt8(1)], timeout_ms)
+    _ = sender.send_frame_within(WsFrame.ping(), timeout_ms)
 
 
 def test_absolute_deadline_expires_condition_wait() raises:
@@ -109,9 +109,7 @@ def test_public_send_expires_without_owner_loop() raises:
     var shutdown = duplex.take_shutdown()
 
     var started_ns = monotonic_now_ns()
-    var published = sender.send_text_until(
-        "deadline-proof", started_ns + 20_000_000
-    )
+    var published = sender.send_text_within("deadline-proof", 20)
     var elapsed_ns = monotonic_now_ns() - started_ns
     shutdown.shutdown()
     try:
@@ -138,9 +136,7 @@ def test_public_send_reports_completed_publication() raises:
     context.unsafe_write(_ReceiverContext(receiver^))
     var argument = _OpaquePtr(unsafe_from_address=Int(context))
     var thread = ThreadHandle.spawn[_receiver_thread](argument)
-    var published = sender.send_text_until(
-        "publication-proof", monotonic_now_ns() + 1_000_000_000
-    )
+    var published = sender.send_text_within("publication-proof", 1_000)
     shutdown.shutdown()
     thread.join()
     peer.close()
@@ -175,10 +171,10 @@ def test_active_backpressured_send_expires_then_shuts_down() raises:
 
     var payload = List[UInt8](capacity=4 * 1024 * 1024)
     payload.resize(4 * 1024 * 1024, UInt8(0x5A))
-    var deadline_ns = monotonic_now_ns() + 2_000_000_000
+    var timeout_ms = 2_000
     var sender_context = unsafe_alloc[_TimedSenderContext](1)
     sender_context.unsafe_write(
-        _TimedSenderContext(sender^, payload^, deadline_ns)
+        _TimedSenderContext(sender^, payload^, timeout_ms)
     )
     var sender_argument = _OpaquePtr(unsafe_from_address=Int(sender_context))
     var sender_thread = ThreadHandle.spawn[_timed_sender_thread](
@@ -186,7 +182,8 @@ def test_active_backpressured_send_expires_then_shuts_down() raises:
     )
 
     var active_seen = False
-    while monotonic_now_ns() < deadline_ns:
+    var observation_deadline_ns = monotonic_now_ns() + 2_000_000_000
+    while monotonic_now_ns() < observation_deadline_ns:
         shared[].control[].sync.lock()
         active_seen = shared[].active_command_id != 0
         shared[].control[].sync.unlock()
@@ -211,6 +208,36 @@ def test_active_backpressured_send_expires_then_shuts_down() raises:
     assert_equal(error_message, "")
     assert_false(published)
     assert_true(receiver_stopped, "shutdown did not release active owner")
+
+
+def test_public_send_validates_timeout() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var client = TcpStream.connect(listener.local_addr())
+    var peer = listener.accept()
+    var duplex = _split_stream(_WsStream(client^))
+    var sender = duplex.take_sender()
+    var receiver = duplex.take_receiver()
+    var shutdown = duplex.take_shutdown()
+
+    with assert_raises(contains="timeout_ms must be positive"):
+        _ = sender.send_text_within("zero", 0)
+    with assert_raises(contains="timeout_ms must be positive"):
+        _ = sender.send_binary_within([UInt8(1)], -1)
+    with assert_raises(contains="deadline overflows Int64"):
+        _ = sender.send_frame_within(
+            WsFrame.ping(), Int(Int64.MAX // 1_000_000)
+        )
+    with assert_raises(contains="timeout_ms is too large"):
+        _ = sender.send_frame_within(
+            WsFrame.ping(), Int(Int64.MAX // 1_000_000) + 1
+        )
+
+    shutdown.shutdown()
+    try:
+        _ = receiver.recv()
+    except:
+        pass
+    peer.close()
 
 
 def test_completion_wins_expiry_race_at_wake() raises:
@@ -264,5 +291,6 @@ def main() raises:
     test_public_send_expires_without_owner_loop()
     test_public_send_reports_completed_publication()
     test_active_backpressured_send_expires_then_shuts_down()
+    test_public_send_validates_timeout()
     test_completion_wins_expiry_race_at_wake()
     print("test_ws_duplex_deadline: OK")

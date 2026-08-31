@@ -76,6 +76,8 @@ from std.memory import UnsafePointer
 from std.collections.span import Span
 
 from ..net.address import IpAddr, SocketAddr
+from ..net.error import Timeout
+from ..runtime._libc_time import monotonic_now_ns
 from ..udp import UdpSocket
 from .crypto import QuicAead
 from .frame import (
@@ -261,6 +263,7 @@ struct QuicClientConnection(Movable):
 
     var sock: UdpSocket
     var peer: SocketAddr
+    var _operation_deadline_ns: Int64
 
     var initial_dcid: ConnectionId
     """Client-chosen Destination CID placed on the first Initial.
@@ -380,6 +383,7 @@ struct QuicClientConnection(Movable):
         self.session = session^
         self.sock = sock^
         self.peer = peer
+        self._operation_deadline_ns = Int64(0)
         self.dcid = initial_dcid.copy()
         self.initial_dcid = initial_dcid^
         self.scid = scid^
@@ -429,27 +433,47 @@ struct QuicClientConnection(Movable):
         self._peer_limits_known = False
         self._conn_send_total = UInt64(0)
 
+    def _set_operation_deadline(mut self, deadline_ns: Int64):
+        """Install an HTTP-owned absolute deadline on this connection."""
+        self._operation_deadline_ns = deadline_ns
+
+    def _clear_operation_deadline(mut self) raises:
+        """Restore an unbounded send timeout before pooling."""
+        if self._operation_deadline_ns != 0:
+            self.sock._set_send_timeout(0)
+        self._operation_deadline_ns = Int64(0)
+
+    def _remaining_operation_ms(self, cap_ms: Int = 0) raises -> Int:
+        if self._operation_deadline_ns == 0:
+            return cap_ms
+        var remaining_ns = self._operation_deadline_ns - monotonic_now_ns()
+        if remaining_ns <= 0:
+            raise Timeout("HTTP operation deadline")
+        var remaining_ms = Int(remaining_ns // 1_000_000)
+        if remaining_ns % 1_000_000 != 0:
+            remaining_ms += 1
+        if cap_ms > 0 and cap_ms < remaining_ms:
+            return cap_ms
+        return remaining_ms
+
+    def _send_datagram(mut self, data: Span[UInt8, _]) raises:
+        if self._operation_deadline_ns != 0:
+            self.sock._set_send_timeout(self._remaining_operation_ms())
+        _ = self.sock.send_to(data, self.peer)
+
     @staticmethod
-    def start(
+    def _start_internal(
         peer: SocketAddr,
         connector: RustlsQuicConnector,
         server_name: String,
-        max_idle_timeout_ms: UInt64 = UInt64(30_000),
-        initial_max_data: UInt64 = UInt64(1 << 20),
-        max_udp_payload_size: Int = 1452,
-        aead_choice: Int = QuicAead.AES_128_GCM,
-        enable_0rtt: Bool = False,
+        max_idle_timeout_ms: UInt64,
+        initial_max_data: UInt64,
+        max_udp_payload_size: Int,
+        aead_choice: Int,
+        enable_0rtt: Bool,
+        operation_deadline_ns: Int64,
     ) raises -> QuicClientConnection:
-        """Open a client connection and emit the first Initial
-        (ClientHello) packet without blocking on the response.
-
-        Picks the Initial DCID + client SCID, builds the rustls
-        client session with the encoded client transport
-        parameters, drains the ClientHello, and ships the padded
-        Initial datagram. Drive the handshake to completion with
-        :meth:`poll` (or use :meth:`connect` for the blocking
-        convenience).
-        """
+        """Construct the shared start path with an optional deadline."""
         var initial_dcid = _random_cid(8)
         var scid = _random_cid(8)
         var tp = _encode_client_transport_params(
@@ -475,6 +499,7 @@ struct QuicClientConnection(Movable):
             max_udp_payload_size,
         )
         self.enable_0rtt = enable_0rtt
+        self._operation_deadline_ns = operation_deadline_ns
         self._send_first_initial()
         if enable_0rtt:
             # On a resumed connection (same connector reused, server
@@ -486,6 +511,39 @@ struct QuicClientConnection(Movable):
             # no early keys -- a harmless no-op.
             self._early_keys_ready = self.session.install_early_keys()
         return self^
+
+    @staticmethod
+    def start(
+        peer: SocketAddr,
+        connector: RustlsQuicConnector,
+        server_name: String,
+        max_idle_timeout_ms: UInt64 = UInt64(30_000),
+        initial_max_data: UInt64 = UInt64(1 << 20),
+        max_udp_payload_size: Int = 1452,
+        aead_choice: Int = QuicAead.AES_128_GCM,
+        enable_0rtt: Bool = False,
+    ) raises -> QuicClientConnection:
+        """Open a client connection and emit the first Initial
+        (ClientHello) packet without blocking on the response.
+
+        Picks the Initial DCID + client SCID, builds the rustls
+        client session with the encoded client transport
+        parameters, drains the ClientHello, and ships the padded
+        Initial datagram. Drive the handshake to completion with
+        :meth:`poll` (or use :meth:`connect` for the blocking
+        convenience).
+        """
+        return QuicClientConnection._start_internal(
+            peer,
+            connector,
+            server_name,
+            max_idle_timeout_ms,
+            initial_max_data,
+            max_udp_payload_size,
+            aead_choice,
+            enable_0rtt,
+            Int64(0),
+        )
 
     @staticmethod
     def connect(
@@ -530,6 +588,37 @@ struct QuicClientConnection(Movable):
             _ = self.poll(timeout_ms=100)
         return self^
 
+    @staticmethod
+    def _connect_until(
+        peer: SocketAddr,
+        connector: RustlsQuicConnector,
+        server_name: String,
+        deadline_ns: Int64,
+        max_idle_timeout_ms: UInt64 = UInt64(30_000),
+        initial_max_data: UInt64 = UInt64(1 << 20),
+        max_udp_payload_size: Int = 1452,
+        aead_choice: Int = QuicAead.AES_128_GCM,
+        enable_0rtt: Bool = False,
+    ) raises -> QuicClientConnection:
+        """Connect under an absolute deadline owned by the HTTP client."""
+        if deadline_ns <= monotonic_now_ns():
+            raise Timeout("HTTP operation deadline")
+        var self = QuicClientConnection._start_internal(
+            peer,
+            connector,
+            server_name,
+            max_idle_timeout_ms,
+            initial_max_data,
+            max_udp_payload_size,
+            aead_choice,
+            enable_0rtt,
+            deadline_ns,
+        )
+        while not self.established:
+            _ = self.poll(timeout_ms=self._remaining_operation_ms(100))
+        _ = self._remaining_operation_ms()
+        return self^
+
     # ── First flight ────────────────────────────────────────────────
 
     def _send_first_initial(mut self) raises:
@@ -544,7 +633,7 @@ struct QuicClientConnection(Movable):
         # the token + Retry-derived Initial keys).
         self.first_initial_crypto = ch.copy()
         var dg = self._build_initial(ch, pad=True, with_ack=False)
-        _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+        self._send_datagram(Span[UInt8, _](dg))
         self.tx_initial_offset += UInt64(len(ch))
 
     # ── Poll loop ───────────────────────────────────────────────────
@@ -562,7 +651,8 @@ struct QuicClientConnection(Movable):
         var events = empty_events()
         var buf = List[UInt8]()
         buf.resize(self.max_udp_payload_size, 0)
-        self.sock.set_recv_timeout(timeout_ms)
+        var effective_timeout_ms = self._remaining_operation_ms(timeout_ms)
+        self.sock.set_recv_timeout(effective_timeout_ms)
         var got: Int
         try:
             var pair = self.sock.recv_from(Span[UInt8, _](buf))
@@ -644,7 +734,7 @@ struct QuicClientConnection(Movable):
                 continue
             var dg = self._build_1rtt(frames^, ack_eliciting=True)
             if len(dg) > 0:
-                _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+                self._send_datagram(Span[UInt8, _](dg))
 
     def _check_pto(mut self) raises:
         """Fire the PTO if the probe timer has elapsed with
@@ -664,7 +754,7 @@ struct QuicClientConnection(Movable):
             return
         var dg = self._build_1rtt(frames^, ack_eliciting=True)
         if len(dg) > 0:
-            _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+            self._send_datagram(Span[UInt8, _](dg))
 
     def _flush_migration(mut self, events: ConnectionEvents) raises:
         """Send the migration frames surfaced this poll: a
@@ -700,7 +790,7 @@ struct QuicClientConnection(Movable):
             payload.append(UInt8(0))
         var dg = self._build_1rtt(payload^)
         if len(dg) > 0:
-            _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+            self._send_datagram(Span[UInt8, _](dg))
 
     def _handle_retry(
         mut self, datagram: Span[UInt8, _], lh: LongHeader
@@ -729,7 +819,7 @@ struct QuicClientConnection(Movable):
         self.tx_initial_offset = UInt64(0)
         var ch = self.first_initial_crypto.copy()
         var dg = self._build_initial(ch, pad=True, with_ack=False)
-        _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+        self._send_datagram(Span[UInt8, _](dg))
         self.tx_initial_offset += UInt64(len(ch))
 
     def _process_datagram(
@@ -996,7 +1086,7 @@ struct QuicClientConnection(Movable):
             self.tx_initial_crypto = List[UInt8]()
             var dg = self._build_initial(crypto, pad=False, with_ack=True)
             if len(dg) > 0:
-                _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+                self._send_datagram(Span[UInt8, _](dg))
                 self.tx_initial_offset += UInt64(len(crypto))
                 self.rx_initial_ack_pending = False
         if self.have_hs_keys and (
@@ -1006,7 +1096,7 @@ struct QuicClientConnection(Movable):
             self.tx_handshake_crypto = List[UInt8]()
             var dg = self._build_handshake(crypto, with_ack=True)
             if len(dg) > 0:
-                _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+                self._send_datagram(Span[UInt8, _](dg))
                 self.tx_handshake_offset += UInt64(len(crypto))
                 self.rx_handshake_ack_pending = False
         if self.have_1rtt_keys and (
@@ -1030,7 +1120,7 @@ struct QuicClientConnection(Movable):
                     payload^, ack_eliciting=carries_crypto
                 )
                 if len(dg) > 0:
-                    _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+                    self._send_datagram(Span[UInt8, _](dg))
             self.rx_1rtt_ack_pending = False
 
     def _build_initial(
@@ -1334,7 +1424,7 @@ struct QuicClientConnection(Movable):
             encode_stream(sf, payload, emit_length=True)
             var dg = self._build_1rtt(payload^, ack_eliciting=True)
             if len(dg) > 0:
-                _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+                self._send_datagram(Span[UInt8, _](dg))
             off += UInt64(take)
             sent += take
             if is_last:
@@ -1438,7 +1528,7 @@ struct QuicClientConnection(Movable):
             encode_stream(sf, payload, emit_length=True)
             var dg = self._build_0rtt(payload^)
             if len(dg) > 0:
-                _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+                self._send_datagram(Span[UInt8, _](dg))
             off += UInt64(take)
             sent += take
             if is_last:
@@ -1494,7 +1584,7 @@ struct QuicClientConnection(Movable):
             payload.append(UInt8(0))
         var dg = self._build_1rtt(payload^, ack_eliciting=True)
         if len(dg) > 0:
-            _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+            self._send_datagram(Span[UInt8, _](dg))
 
     # ── Connection migration (RFC 9000 §9) ──────────────────────────
 
@@ -1636,7 +1726,7 @@ struct QuicClientConnection(Movable):
                 payload.append(UInt8(0))
             var dg = self._build_1rtt(payload^)
             if len(dg) > 0:
-                _ = self.sock.send_to(Span[UInt8, _](dg), self.peer)
+                self._send_datagram(Span[UInt8, _](dg))
         self.sock.close()
 
     def close(mut self):

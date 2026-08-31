@@ -108,6 +108,7 @@ comptime SHUT_WR: c_int = 1
 comptime SHUT_RDWR: c_int = 2
 
 # ── poll(2) event bits ────────────────────────────────────────────────────────
+comptime POLLIN: c_int = 1
 comptime POLLOUT: c_int = 4
 comptime POLLERR: c_int = 8
 comptime POLLHUP: c_int = 16

@@ -48,10 +48,18 @@ sequence. Same idiom as
 """
 
 from std.sys import stderr
-from std.ffi import OwnedDLHandle, c_int, CStringSlice
+from std.ffi import (
+    OwnedDLHandle,
+    c_int,
+    c_uint,
+    CStringSlice,
+    ErrNo,
+    get_errno,
+)
 from std.memory import UnsafePointer, stack_allocation
 from ..dns import resolve
 from ..net import SocketAddr, NetworkError, _find_flare_lib
+from ..net._libc import POLLIN, POLLOUT, POLLFD_SIZE, _poll
 from ..utils.dylib import dl_sym
 from ..tcp import TcpStream
 from ..tcp.stream import _connect_with_fallback
@@ -681,6 +689,28 @@ struct _TlsClientHandshake(Movable):
         return TlsStream(tcp^, ctx, ssl, lib^)
 
 
+def _wait_tls_operation_fd(mut tcp: TcpStream, interest: c_int) raises:
+    """Wait for one handshake edge without resetting the HTTP deadline."""
+    while True:
+        var timeout_ms = tcp._remaining_operation_ms()
+        var pollfd = stack_allocation[Int(POLLFD_SIZE), UInt8]()
+        for i in range(Int(POLLFD_SIZE)):
+            pollfd.unsafe_offset(i).unsafe_write(0)
+        pollfd.unsafe_bitcast[c_int]().unsafe_write(tcp._socket.fd)
+        pollfd.unsafe_offset(4).unsafe_bitcast[Int16]().unsafe_write(
+            Int16(interest)
+        )
+        var ready = _poll(pollfd, c_uint(1), c_int(timeout_ms))
+        if ready > c_int(0):
+            return
+        if ready == c_int(0):
+            continue
+        var error = get_errno()
+        if error == ErrNo.EINTR:
+            continue
+        raise NetworkError("poll failed during TLS handshake", Int(error.value))
+
+
 struct TlsStream(Movable, Readable):
     """An encrypted TCP stream using TLS (via OpenSSL FFI).
 
@@ -761,7 +791,8 @@ struct TlsStream(Movable, Readable):
             # stream's lifetime, so these no longer open (and cannot
             # fail on) a per-call handle. tcp fd closed by _tcp.__deinit__.
             try:
-                _ = _do_ssl_shutdown(self._lib, self._ssl)
+                if not self._tcp._operation_deadline_active():
+                    _ = _do_ssl_shutdown(self._lib, self._ssl)
                 _do_ssl_free(self._lib, self._ssl)
                 _do_ssl_ctx_free(self._lib, self._ctx)
             except:
@@ -941,6 +972,34 @@ struct TlsStream(Movable, Readable):
             raise TlsHandshakeError(err)
         return TlsStream(tcp^, ctx, ssl)
 
+    @staticmethod
+    def _connect_over_tcp_until(
+        var tcp: TcpStream, host: String, config: TlsConfig
+    ) raises -> TlsStream:
+        """Run a client handshake under ``tcp``'s installed deadline.
+
+        The public HTTP boundary accepts only a duration. Its absolute
+        timestamp stays internal and reaches this stepwise handshake through
+        the stream that already owns the connected socket.
+        """
+        if not tcp._operation_deadline_active():
+            raise Error("deadline-aware TLS connect requires a deadline")
+        tcp._socket.set_nonblocking(True)
+        var handshake = _TlsClientHandshake.start(tcp._socket.fd, host, config)
+        try:
+            while True:
+                var step = handshake.step(host)
+                if step == 0:
+                    break
+                var interest = POLLIN if step == 1 else POLLOUT
+                _wait_tls_operation_fd(tcp, interest)
+            tcp._socket.set_nonblocking(False)
+            handshake.prepare_finish(tcp._socket.fd)
+            return handshake^.finish(tcp^)
+        except error:
+            handshake.close_abortive()
+            raise error^
+
     # ── I/O ───────────────────────────────────────────────────────────────────
 
     def set_recv_timeout(self, ms: Int) raises:
@@ -957,6 +1016,21 @@ struct TlsStream(Movable, Readable):
             NetworkError: If ``setsockopt(2)`` fails.
         """
         self._tcp.set_recv_timeout(ms)
+
+    def set_send_timeout(self, ms: Int) raises:
+        """Bound each subsequent encrypted write by ``ms``."""
+        self._tcp.set_send_timeout(ms)
+
+    def _set_operation_deadline(
+        mut self, deadline_ns: Int64, recv_cap_ms: Int = 0
+    ):
+        self._tcp._set_operation_deadline(deadline_ns, recv_cap_ms)
+
+    def _clear_operation_deadline(mut self) raises:
+        self._tcp._clear_operation_deadline()
+
+    def _operation_deadline_active(self) -> Bool:
+        return self._tcp._operation_deadline_active()
 
     def _set_nonblocking(self, enabled: Bool) raises:
         """Set the owned socket's non-blocking mode for an internal owner loop.
@@ -1051,6 +1125,7 @@ struct TlsStream(Movable, Readable):
         Raises:
             NetworkError: On I/O or decryption error.
         """
+        self._tcp._apply_operation_read_deadline()
         var n = _do_ssl_read(self._lib, self._ssl, buf, size)
         if n < 0:
             raise NetworkError("TLS read error: " + _c_err(self._lib))
@@ -1085,6 +1160,7 @@ struct TlsStream(Movable, Readable):
         Raises:
             NetworkError: On I/O or encryption error.
         """
+        self._tcp._apply_operation_write_deadline()
         var n = _do_ssl_write(self._lib, self._ssl, data)
         if n < 0:
             raise NetworkError("TLS write error: " + _c_err(self._lib))
@@ -1358,7 +1434,7 @@ struct TlsStream(Movable, Readable):
         Idempotent — safe to call multiple times. The destructor also calls
         this, so explicit ``close()`` is not required.
         """
-        if self._ssl != 0:
+        if self._ssl != 0 and not self._tcp._operation_deadline_active():
             self._shutdown_graceful()
         self._close_abortive()
 

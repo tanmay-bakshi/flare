@@ -359,6 +359,10 @@ struct UdpSocket(Movable):
         """
         self._socket.set_recv_timeout(ms)
 
+    def _set_send_timeout(self, ms: Int) raises:
+        """Set the internal datagram publication timeout."""
+        self._socket.set_send_timeout(ms)
+
     def set_recv_buffer(self, bytes: Int) raises:
         """Request a kernel receive-buffer size via ``SO_RCVBUF``.
 

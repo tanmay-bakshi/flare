@@ -70,6 +70,7 @@ from ..net._libc import (
     POLLOUT,
     POLLFD_SIZE,
 )
+from ..runtime._libc_time import monotonic_now_ns
 
 
 def _do_flare_connect_timeout(
@@ -221,6 +222,8 @@ struct TcpStream(Movable, Readable):
 
     var _socket: RawSocket
     var _peer: SocketAddr
+    var _operation_deadline_ns: Int64
+    var _operation_recv_cap_ms: Int
 
     def __init__(out self, var socket: RawSocket, peer: SocketAddr):
         """Wrap an already-connected ``RawSocket``.
@@ -235,6 +238,8 @@ struct TcpStream(Movable, Readable):
         """
         self._socket = socket^
         self._peer = peer
+        self._operation_deadline_ns = 0
+        self._operation_recv_cap_ms = 0
 
     def __deinit__(deinit self):
         self._socket.close()
@@ -529,6 +534,7 @@ struct TcpStream(Movable, Readable):
         if size == 0:
             return 0
         while True:
+            self._apply_operation_read_deadline()
             var got = _recv(self._socket.fd, buf, c_size_t(size), c_int(0))
             if got > 0:
                 return Int(got)
@@ -604,6 +610,7 @@ struct TcpStream(Movable, Readable):
             return 0
         var ptr = data.unsafe_ptr()
         while True:
+            self._apply_operation_write_deadline()
             var sent = _send(self._socket.fd, ptr, c_size_t(n), MSG_NOSIGNAL)
             if sent > 0:
                 return Int(sent)
@@ -741,6 +748,50 @@ struct TcpStream(Movable, Readable):
             ms: Timeout in milliseconds. 0 disables the timeout.
         """
         self._socket.set_send_timeout(ms)
+
+    def _set_operation_deadline(
+        mut self, deadline_ns: Int64, recv_cap_ms: Int = 0
+    ):
+        """Install one HTTP-owned absolute deadline on this stream."""
+        self._operation_deadline_ns = deadline_ns
+        self._operation_recv_cap_ms = recv_cap_ms
+
+    def _clear_operation_deadline(mut self) raises:
+        """Restore legacy socket timeouts before a stream enters a pool."""
+        if self._operation_deadline_ns != 0:
+            self._socket.set_recv_timeout(self._operation_recv_cap_ms)
+            self._socket.set_send_timeout(0)
+        self._operation_deadline_ns = 0
+        self._operation_recv_cap_ms = 0
+
+    def _operation_deadline_active(self) -> Bool:
+        return self._operation_deadline_ns != 0
+
+    def _remaining_operation_ms(self, cap_ms: Int = 0) raises -> Int:
+        """Return the positive, ceil-rounded budget for one syscall."""
+        if self._operation_deadline_ns == 0:
+            return cap_ms
+        var remaining_ns = self._operation_deadline_ns - monotonic_now_ns()
+        if remaining_ns <= 0:
+            raise Timeout("HTTP operation deadline")
+        var remaining_ms = Int(remaining_ns // 1_000_000)
+        if remaining_ns % 1_000_000 != 0:
+            remaining_ms += 1
+        if cap_ms > 0 and cap_ms < remaining_ms:
+            return cap_ms
+        return remaining_ms
+
+    def _apply_operation_read_deadline(self) raises:
+        if self._operation_deadline_ns == 0:
+            return
+        self._socket.set_recv_timeout(
+            self._remaining_operation_ms(self._operation_recv_cap_ms)
+        )
+
+    def _apply_operation_write_deadline(self) raises:
+        if self._operation_deadline_ns == 0:
+            return
+        self._socket.set_send_timeout(self._remaining_operation_ms())
 
 
 def _connect_with_fallback(

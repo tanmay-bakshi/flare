@@ -60,11 +60,10 @@ from ..tcp.stream import _connect_with_fallback
 from ..tls import TlsStream, TlsConfig
 from ..net import NetworkError
 from ..net import SocketAddr
-from ..dns import resolve
 
 from ..http2.client import Http2ClientConnection
 from ..quic.client import QuicClientConnection
-from ..http3.client import Http3ClientConnection
+from ..http3.client import Http3ClientConnection, Http3Response
 from ..tls.rustls_quic import RustlsQuicConnector
 from ..qpack import QpackHeader
 from std.os import getenv
@@ -99,6 +98,7 @@ from ._client.h3_race import (
     RACE_NONE,
     race_http3_h2_connect,
 )
+from ._client.deadline import _HttpOperationDeadline
 from ..net.socket import RawSocket
 from ..net._libc import (
     AF_INET,
@@ -303,6 +303,13 @@ struct HttpClient(Movable):
     :meth:`with_cookies` opts in. When enabled, :meth:`_send_once`
     captures ``Set-Cookie`` response headers and replays them as a
     ``Cookie`` request header. Freed in :meth:`__deinit__`."""
+    var _operation_deadline: _HttpOperationDeadline
+    """Whole-request deadline installed only while ``send_within`` runs.
+
+    The public boundary accepts a duration. Its absolute monotonic value is
+    internal state shared read-only with the HTTP/3 connection-race workers,
+    so every configured wire path consumes one operation budget.
+    """
 
     def __init__(
         out self,
@@ -357,6 +364,7 @@ struct HttpClient(Movable):
         self._retry_enabled = False
         self._cookies = CookieStore.disabled()
         self._proxy = String("")
+        self._operation_deadline = _HttpOperationDeadline.inactive()
 
     def __init__(
         out self,
@@ -391,6 +399,7 @@ struct HttpClient(Movable):
         self._retry_enabled = False
         self._cookies = CookieStore.disabled()
         self._proxy = String("")
+        self._operation_deadline = _HttpOperationDeadline.inactive()
 
     def __init__[
         A: Auth
@@ -429,6 +438,7 @@ struct HttpClient(Movable):
         self._retry_enabled = False
         self._cookies = CookieStore.disabled()
         self._proxy = String("")
+        self._operation_deadline = _HttpOperationDeadline.inactive()
 
     def __init__[
         A: Auth
@@ -467,6 +477,7 @@ struct HttpClient(Movable):
         self._retry_enabled = False
         self._cookies = CookieStore.disabled()
         self._proxy = String("")
+        self._operation_deadline = _HttpOperationDeadline.inactive()
 
     def __deinit__(deinit self):
         """Free the pooled fds + the ``Alt-Svc`` store owned by this
@@ -777,6 +788,41 @@ struct HttpClient(Movable):
         with open(path, "r") as f:
             return f.read()
 
+    def _connect_tcp(self, host: String, port: UInt16) raises -> TcpStream:
+        """Connect one TCP stream under the active operation budget."""
+        return self._operation_deadline.connect(host, port, self._timeout_ms)
+
+    def _arm_tcp(self, mut stream: TcpStream) raises:
+        """Apply the active operation budget to a checked-out stream."""
+        self._operation_deadline.check()
+        if self._operation_deadline.active():
+            stream._set_operation_deadline(
+                self._operation_deadline.deadline_ns, self._timeout_ms
+            )
+        else:
+            stream.set_recv_timeout(self._timeout_ms)
+
+    def _arm_tls(self, mut stream: TlsStream) raises:
+        """Apply the active operation budget to checked-out TLS."""
+        self._operation_deadline.check()
+        if self._operation_deadline.active():
+            stream._set_operation_deadline(
+                self._operation_deadline.deadline_ns, self._timeout_ms
+            )
+        else:
+            stream.set_recv_timeout(self._timeout_ms)
+
+    def _connect_tls(self, u: Url, config: TlsConfig) raises -> TlsStream:
+        """Resolve, connect, and handshake TLS inside one budget."""
+        if not self._operation_deadline.active():
+            var stream = TlsStream.connect_timeout(
+                u.host, u.port, config, self._timeout_ms
+            )
+            stream.set_recv_timeout(self._timeout_ms)
+            return stream^
+        var tcp = self._connect_tcp(u.host, u.port)
+        return TlsStream._connect_over_tcp_until(tcp^, u.host, config)
+
     def _dial_http3(self, u: Url) raises -> Http3ClientConnection:
         """Open a fresh established :class:`Http3ClientConnection` to
         ``u``'s origin (DNS -> rustls QUIC connector -> blocking QUIC
@@ -790,7 +836,7 @@ struct HttpClient(Movable):
         ``localhost`` on a typical Linux ``/etc/hosts``) may put the
         family the server isn't listening on first.
         """
-        var addrs = resolve(u.host)
+        var addrs = self._operation_deadline.resolve(u.host)
         var alpn = List[String]()
         alpn.append("h3")
         # Empty ca_bundle parity with the OpenSSL h1/h2 path: fall back
@@ -805,10 +851,21 @@ struct HttpClient(Movable):
         for i in range(len(addrs)):
             var peer = SocketAddr(addrs[i], u.port)
             try:
-                var quic = QuicClientConnection.connect(peer, connector, u.host)
+                var quic: QuicClientConnection
+                if self._operation_deadline.active():
+                    quic = QuicClientConnection._connect_until(
+                        peer,
+                        connector,
+                        u.host,
+                        self._operation_deadline.deadline_ns,
+                    )
+                else:
+                    quic = QuicClientConnection.connect(peer, connector, u.host)
                 self._quic_pool.note_dial()
                 return Http3ClientConnection(quic^)
             except e:
+                if self._operation_deadline.expired():
+                    self._operation_deadline.check()
                 last_err = String(e)
         raise NetworkError(
             "h3: all addresses failed for " + u.host + ": " + last_err
@@ -844,9 +901,35 @@ struct HttpClient(Movable):
         var authority = u.host
         if u.port != 443:
             authority = authority + ":" + String(Int(u.port))
-        var hr = h3.fetch(
-            method, "https", authority, u.request_target(), headers, body
-        )
+        var hr: Http3Response
+        if self._operation_deadline.active():
+            var sid = h3.request(
+                method,
+                "https",
+                authority,
+                u.request_target(),
+                headers,
+                body,
+            )
+            while True:
+                self._operation_deadline.check()
+                _ = h3.poll_responses(
+                    self._operation_deadline.remaining_ms(100)
+                )
+                var ready = h3.take_if_complete(sid)
+                if ready:
+                    hr = ready.take()
+                    break
+        else:
+            hr = h3.fetch(
+                method,
+                "https",
+                authority,
+                u.request_target(),
+                headers,
+                body,
+            )
+        self._operation_deadline.check()
         var resp = Response(hr.status, "", hr.body.copy())
         for i in range(len(hr.headers)):
             resp.headers.set(hr.headers[i].name, hr.headers[i].value)
@@ -865,12 +948,18 @@ struct HttpClient(Movable):
         var pooled = self._quic_pool.acquire(key)
         if pooled:
             var existing = pooled.take()
+            if self._operation_deadline.active():
+                existing.quic._set_operation_deadline(
+                    self._operation_deadline.deadline_ns
+                )
             if existing.is_established():
+                existing.quic._clear_operation_deadline()
                 self._quic_pool.release(key, existing^)
                 return True
             existing.close()
         var fresh = self._dial_http3(u)
         if fresh.is_established():
+            fresh.quic._clear_operation_deadline()
             self._quic_pool.release(key, fresh^)
             return True
         fresh.close()
@@ -892,12 +981,10 @@ struct HttpClient(Movable):
             tls_cfg.alpn = List[String]()
             tls_cfg.alpn.append("h2")
             tls_cfg.alpn.append("http/1.1")
-        var stream = TlsStream.connect_timeout(
-            u.host, u.port, tls_cfg^, self._timeout_ms
-        )
-        stream.set_recv_timeout(self._timeout_ms)
+        var stream = self._connect_tls(u, tls_cfg^)
         var negotiated = stream.alpn_selected()
         if self._tls_pool.enabled() and negotiated != "h2":
+            stream._clear_operation_deadline()
             var key = TlsConnectionPool.build_key(u.scheme, u.host, Int(u.port))
             self._tls_pool.release(key, stream^)
         else:
@@ -928,6 +1015,10 @@ struct HttpClient(Movable):
         var pooled = self._quic_pool.acquire(key)
         if pooled:
             var h3 = pooled.take()
+            if self._operation_deadline.active():
+                h3.quic._set_operation_deadline(
+                    self._operation_deadline.deadline_ns
+                )
             var failed = False
             var resp = Response(0, "", List[UInt8]())
             try:
@@ -938,18 +1029,21 @@ struct HttpClient(Movable):
                 failed = True
             if not failed:
                 if h3.is_established():
+                    h3.quic._clear_operation_deadline()
                     self._quic_pool.release(key, h3^)
                 else:
                     h3.close()
                 return resp^
             # Stale reused connection: drop it and dial fresh below.
             h3.close()
+            self._operation_deadline.check()
 
         var fresh = self._dial_http3(u)
         var resp = self._run_http3_request(
             fresh, u, method, extra_headers, body, auth_header
         )
         if fresh.is_established():
+            fresh.quic._clear_operation_deadline()
             self._quic_pool.release(key, fresh^)
         else:
             fresh.close()
@@ -997,6 +1091,7 @@ struct HttpClient(Movable):
                 )
                 if reused:
                     return reused.take()
+                self._operation_deadline.check()
                 # Stale pooled connection: dial fresh below.
 
         # 2. Fresh dial with ALPN negotiation.
@@ -1008,13 +1103,15 @@ struct HttpClient(Movable):
         var stream: TlsStream
         if proxy.byte_length() > 0:
             var tcp = self._connect_tunnel(proxy, u.host, u.port)
-            stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg^)
-            stream.set_recv_timeout(self._timeout_ms)
+            if self._operation_deadline.active():
+                stream = TlsStream._connect_over_tcp_until(
+                    tcp^, u.host, tls_cfg^
+                )
+            else:
+                stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg^)
+                stream.set_recv_timeout(self._timeout_ms)
         else:
-            stream = TlsStream.connect_timeout(
-                u.host, u.port, tls_cfg^, self._timeout_ms
-            )
-            stream.set_recv_timeout(self._timeout_ms)
+            stream = self._connect_tls(u, tls_cfg^)
         var negotiated = stream.alpn_selected()
         if negotiated == "h2":
             var resp_h2 = _send_h2_over_tls(
@@ -1037,6 +1134,7 @@ struct HttpClient(Movable):
             var can_reuse2 = False
             var resp_f = _read_http_response_framed_tls(stream, can_reuse2)
             if can_reuse2:
+                stream._clear_operation_deadline()
                 self._tls_pool.release(key, stream^)
             else:
                 stream.close()
@@ -1060,6 +1158,7 @@ struct HttpClient(Movable):
         alive-closed signature) the stream is closed and ``None`` is
         returned so the caller dials a fresh connection (RFC 7230
         sec 6.3.1)."""
+        self._arm_tls(st)
         var io_failed = False
         try:
             var wb = wire.as_bytes()
@@ -1078,12 +1177,14 @@ struct HttpClient(Movable):
                 parsed = False
             if parsed:
                 if can_reuse:
+                    st._clear_operation_deadline()
                     self._tls_pool.release(key, st^)
                 else:
                     st.close()
                 return Optional(resp^)
         # Stale connection: close and signal a pool miss.
         st.close()
+        self._operation_deadline.check()
         return None
 
     # ── Streaming request body ────────────────────────────────────────────────
@@ -1294,8 +1395,9 @@ struct HttpClient(Movable):
         to carry the origin request (cleartext GET or a TLS handshake).
         """
         var pu = Url.parse(proxy_url)
-        var tcp = _connect_with_fallback(pu.host, pu.port, self._timeout_ms)
-        tcp.set_recv_timeout(self._timeout_ms)
+        var tcp = self._connect_tcp(pu.host, pu.port)
+        if not self._operation_deadline.active():
+            tcp.set_recv_timeout(self._timeout_ms)
         var target = host + ":" + String(Int(port))
         var req = String("CONNECT ") + target + " HTTP/1.1\r\n"
         req += "Host: " + target + "\r\n"
@@ -1333,6 +1435,7 @@ struct HttpClient(Movable):
             sp += 1
         if sp + 1 >= line_end or acc[sp + 1] != UInt8(ord("2")):
             raise NetworkError("proxy CONNECT: non-2xx from proxy")
+        self._operation_deadline.check()
         return tcp^
 
     # ── High-level helpers ────────────────────────────────────────────────────
@@ -1633,6 +1736,31 @@ struct HttpClient(Movable):
 
     # ── Core ──────────────────────────────────────────────────────────────────
 
+    def send_within(
+        mut self, var req: Request, timeout_ms: Int
+    ) raises -> Response:
+        """Send one request under a duration-bounded whole operation.
+
+        The duration covers DNS, every address and protocol fallback,
+        redirects, retries and backoff, request publication, and the complete
+        response read. The absolute deadline never crosses this public API.
+        """
+        if self._operation_deadline.active():
+            raise Error("nested HTTP operation deadlines are not supported")
+        self._operation_deadline = _HttpOperationDeadline.from_timeout(
+            timeout_ms
+        )
+        try:
+            var response = self.send(req^)
+            self._operation_deadline.check()
+            self._operation_deadline = _HttpOperationDeadline.inactive()
+            return response^
+        except error:
+            var deadline = self._operation_deadline
+            self._operation_deadline = _HttpOperationDeadline.inactive()
+            deadline.check()
+            raise error^
+
     def send(self, req: Request) raises -> Response:
         """Send an HTTP request and return the response.
 
@@ -1676,6 +1804,7 @@ struct HttpClient(Movable):
             return self._send_once(req)
         var attempt = 1
         while True:
+            self._operation_deadline.check()
             try:
                 var resp = self._send_once(req)
                 if resp.status < 500 or attempt >= attempts:
@@ -1685,7 +1814,10 @@ struct HttpClient(Movable):
                     raise e^
             var sleep_ms = _backoff_sleep_ms(self._retry, attempt + 1)
             if sleep_ms > 0:
-                _ = libc_nanosleep_ms(sleep_ms)
+                _ = libc_nanosleep_ms(
+                    self._operation_deadline.remaining_ms(sleep_ms)
+                )
+                self._operation_deadline.check()
             attempt += 1
 
     def _send_once(self, req: Request) raises -> Response:
@@ -1705,6 +1837,7 @@ struct HttpClient(Movable):
             headers.set("Accept-Encoding", "gzip, deflate, br")
 
         while True:
+            self._operation_deadline.check()
             # Attach session cookies for this hop (jar wins over a stale
             # caller-supplied Cookie since it carries the live session).
             var cookie_hdr = self._cookies.request_header()
@@ -1714,6 +1847,7 @@ struct HttpClient(Movable):
             var resp = self._do_request(
                 method, current_url, headers, body, auth_header
             )
+            self._operation_deadline.check()
 
             # Capture Set-Cookie(s) into the jar (no-op if disabled).
             if self._cookies.enabled():
@@ -1817,6 +1951,7 @@ struct HttpClient(Movable):
         Raises:
             NetworkError: On I/O or parse failure.
         """
+        self._operation_deadline.check()
         var u = Url.parse(url)
 
         # Pooling is enabled only for cleartext h1. The TLS path
@@ -1901,12 +2036,14 @@ struct HttpClient(Movable):
                         Int(UnsafePointer(to=self)),
                         url,
                     )
+                    self._operation_deadline.check()
                     if winner == RACE_H3:
                         try:
                             return self._send_http3(
                                 u, method, extra_headers, body, auth_header
                             )
                         except:
+                            self._operation_deadline.check()
                             pass  # h3 dropped post-connect: fall back
                     # RACE_H2 or RACE_NONE (or an h3 post-connect drop):
                     # use the proven TLS path. On RACE_NONE both connects
@@ -1920,6 +2057,7 @@ struct HttpClient(Movable):
                         u, method, extra_headers, body, auth_header
                     )
                 except:
+                    self._operation_deadline.check()
                     pass  # transparent fallback to h2/h1
             return self._send_h2_or_h1_tls(
                 u, method, extra_headers, body, wire, auth_header
@@ -1930,10 +2068,9 @@ struct HttpClient(Movable):
             if proxy.byte_length() > 0:
                 stream = self._connect_tunnel(proxy, u.host, u.port)
             else:
-                stream = _connect_with_fallback(
-                    u.host, u.port, self._timeout_ms
-                )
-                stream.set_recv_timeout(self._timeout_ms)
+                stream = self._connect_tcp(u.host, u.port)
+                if not self._operation_deadline.active():
+                    stream.set_recv_timeout(self._timeout_ms)
             if self._prefer_h2c:
                 # h2c via prior knowledge (RFC 9113 §3.4):
                 # send the connection preface immediately and
@@ -2009,9 +2146,11 @@ struct HttpClient(Movable):
                 c_int(pooled_fd), AF_INET, SOCK_STREAM, _wrap=True
             )
             stream = TcpStream(sock^, SocketAddr.localhost(port))
+            self._arm_tcp(stream)
         else:
-            stream = _connect_with_fallback(host, port, self._timeout_ms)
-            stream.set_recv_timeout(self._timeout_ms)
+            stream = self._connect_tcp(host, port)
+            if not self._operation_deadline.active():
+                stream.set_recv_timeout(self._timeout_ms)
 
         var wire_bytes = wire.as_bytes()
         var io_failed = False
@@ -2031,6 +2170,7 @@ struct HttpClient(Movable):
                     # RawSocket so its destructor is a no-op, then
                     # push.
                     var fd = Int(stream._socket.fd)
+                    stream._clear_operation_deadline()
                     stream._socket.fd = INVALID_FD
                     self._pool.release(key, fd)
                 else:
@@ -2043,11 +2183,13 @@ struct HttpClient(Movable):
         # stale-conn signature. Retry once with a fresh connection.
         # Failure on a *fresh* fd is a real error.
         stream.close()
+        self._operation_deadline.check()
         if not attempted_pooled:
             raise NetworkError("HTTP/1.1 pooled request failed")
 
-        var fresh = _connect_with_fallback(host, port, self._timeout_ms)
-        fresh.set_recv_timeout(self._timeout_ms)
+        var fresh = self._connect_tcp(host, port)
+        if not self._operation_deadline.active():
+            fresh.set_recv_timeout(self._timeout_ms)
         fresh.write_all(Span[UInt8, _](wire_bytes))
         if len(body) > 0:
             fresh.write_all(Span[UInt8, _](body))
@@ -2055,6 +2197,7 @@ struct HttpClient(Movable):
         var resp2 = _read_http_response_framed_tcp(fresh, can_reuse2)
         if can_reuse2:
             var fd2 = Int(fresh._socket.fd)
+            fresh._clear_operation_deadline()
             fresh._socket.fd = INVALID_FD
             self._pool.release(key, fd2)
         else:

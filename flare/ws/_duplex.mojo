@@ -3,9 +3,10 @@
 from std.atomic import Atomic, Ordering
 from std.collections import Optional
 from std.ffi import c_int, external_call
-from std.memory import ArcPointer, Pointer
+from std.memory import ArcPointer, Pointer, stack_allocation
 from std.memory.alloc import unsafe_alloc
 from std.os import abort
+from std.sys.info import CompilationTarget
 
 from ._message import WsMessage
 from ._transport import _WsStream
@@ -13,6 +14,7 @@ from .frame import WsFrame, WsOpcode, _encode_client_frame
 from ..net import NetworkError
 from ..net._libc import INVALID_FD, _shutdown, SHUT_RDWR
 from ..runtime.event import Event, INTEREST_READ, INTEREST_WRITE
+from ..runtime._libc_time import monotonic_now_ns
 from ..runtime.reactor import Reactor
 from ..tls.stream import (
     _SSL_IO_WANT_READ,
@@ -26,6 +28,15 @@ comptime _DUPLEX_SYNC_ALIGNMENT: Int = 16
 comptime _OUTBOUND_PLAINTEXT_CHUNK: Int = 16 * 1024
 comptime _WS_STREAM_TOKEN: UInt64 = 1
 comptime _SyncPointer = Pointer[UInt8, MutUntrackedOrigin]
+comptime _TimespecPointer = Pointer[Int64, MutUntrackedOrigin]
+comptime _CLOCK_MONOTONIC: c_int = c_int(1)
+comptime _ETIMEDOUT: c_int = (
+    c_int(60) if CompilationTarget.is_macos() else c_int(110)
+)
+comptime _SEND_WAKE_WAITING: Int = 0
+comptime _SEND_WAKE_COMPLETED: Int = 1
+comptime _SEND_WAKE_STOPPED: Int = 2
+comptime _SEND_WAKE_DEADLINE: Int = 3
 
 
 def _null_sync_pointer() -> _SyncPointer:
@@ -91,13 +102,46 @@ struct _DuplexSync(Movable):
             _SyncPointer,
         ](self.mutex, _null_sync_pointer())
         _require_pthread_success("pthread_mutex_init", mutex_result)
-        var condition_result = external_call[
-            "pthread_cond_init",
-            c_int,
-            _SyncPointer,
-            _SyncPointer,
-        ](self.condition, _null_sync_pointer())
-        _require_pthread_success("pthread_cond_init", condition_result)
+        comptime if CompilationTarget.is_linux():
+            # Bind the condition variable to CLOCK_MONOTONIC once. This keeps
+            # absolute deadline waits on the caller's timebase without relying
+            # on pthread_cond_clockwait, whose glibc availability starts at
+            # 2.30 and is newer than flare's supported Linux floor.
+            var condition_attr = unsafe_alloc[UInt8](
+                _DUPLEX_SYNC_BYTES, alignment=_DUPLEX_SYNC_ALIGNMENT
+            )
+            var attr_init_result = external_call[
+                "pthread_condattr_init", c_int, _SyncPointer
+            ](condition_attr)
+            _require_pthread_success("pthread_condattr_init", attr_init_result)
+            var attr_clock_result = external_call[
+                "pthread_condattr_setclock", c_int, _SyncPointer, c_int
+            ](condition_attr, _CLOCK_MONOTONIC)
+            _require_pthread_success(
+                "pthread_condattr_setclock", attr_clock_result
+            )
+            var condition_result = external_call[
+                "pthread_cond_init",
+                c_int,
+                _SyncPointer,
+                _SyncPointer,
+            ](self.condition, condition_attr)
+            _require_pthread_success("pthread_cond_init", condition_result)
+            var attr_destroy_result = external_call[
+                "pthread_condattr_destroy", c_int, _SyncPointer
+            ](condition_attr)
+            _require_pthread_success(
+                "pthread_condattr_destroy", attr_destroy_result
+            )
+            condition_attr.unsafe_free()
+        else:
+            var condition_result = external_call[
+                "pthread_cond_init",
+                c_int,
+                _SyncPointer,
+                _SyncPointer,
+            ](self.condition, _null_sync_pointer())
+            _require_pthread_success("pthread_cond_init", condition_result)
 
     def __deinit__(deinit self):
         var condition_result = external_call[
@@ -132,6 +176,50 @@ struct _DuplexSync(Movable):
         ](self.condition, self.mutex)
         _require_pthread_success("pthread_cond_wait", result)
 
+    def wait_until(self, deadline_ns: Int64) -> Bool:
+        """Wait through one absolute monotonic deadline.
+
+        The mutex remains locked on return. ``True`` means the condition was
+        signalled; ``False`` means the deadline expired. Callers must always
+        re-check their predicate because either return can race a publication.
+        """
+        var remaining_ns = deadline_ns - monotonic_now_ns()
+        if remaining_ns <= 0:
+            return False
+
+        var timeout = stack_allocation[2, Int64]()
+        var timeout_pointer = _TimespecPointer(unsafe_from_address=Int(timeout))
+        var result: c_int
+        comptime if CompilationTarget.is_macos():
+            # Darwin's portable pthread condition clock is realtime-only. Its
+            # relative extension preserves the caller's monotonic timebase.
+            timeout.unsafe_offset(0).unsafe_write(remaining_ns // 1_000_000_000)
+            timeout.unsafe_offset(1).unsafe_write(remaining_ns % 1_000_000_000)
+            result = external_call[
+                "pthread_cond_timedwait_relative_np",
+                c_int,
+                _SyncPointer,
+                _SyncPointer,
+                _TimespecPointer,
+            ](self.condition, self.mutex, timeout_pointer)
+        else:
+            timeout.unsafe_offset(0).unsafe_write(deadline_ns // 1_000_000_000)
+            timeout.unsafe_offset(1).unsafe_write(deadline_ns % 1_000_000_000)
+            result = external_call[
+                "pthread_cond_timedwait",
+                c_int,
+                _SyncPointer,
+                _SyncPointer,
+                _TimespecPointer,
+            ](self.condition, self.mutex, timeout_pointer)
+
+        if result == c_int(0):
+            return True
+        if result == _ETIMEDOUT:
+            return False
+        _require_pthread_success("pthread condition timed wait", result)
+        return False
+
     def broadcast(self):
         var result = external_call[
             "pthread_cond_broadcast", c_int, _SyncPointer
@@ -159,6 +247,23 @@ struct _WsWriteCommand(Movable):
 def _ignore_resolver_hook(_address: Int):
     """Default hook used while no resolver request is active."""
     pass
+
+
+def _classify_send_wake(
+    completed_command_id: Int64,
+    command_id: Int64,
+    stopping: Bool,
+    now_ns: Int64,
+    deadline_ns: Int64,
+) -> Int:
+    """Classify one publication-fence observation under its mutex."""
+    if completed_command_id >= command_id:
+        return _SEND_WAKE_COMPLETED
+    if stopping:
+        return _SEND_WAKE_STOPPED
+    if deadline_ns != 0 and now_ns >= deadline_ns:
+        return _SEND_WAKE_DEADLINE
+    return _SEND_WAKE_WAITING
 
 
 struct _WsControl(Movable):
@@ -356,6 +461,24 @@ struct _WsDuplexState(Movable):
 
     def send(mut self, var wire: List[UInt8]) raises:
         """Queue one frame and wait for owner-loop publication."""
+        var published = self._send(wire^, 0)
+        if not published:
+            abort("untimed WebSocket send reached a deadline")
+
+    def send_until(
+        mut self, var wire: List[UInt8], deadline_ns: Int64
+    ) raises -> Bool:
+        """Wait through an absolute monotonic publication deadline."""
+        if deadline_ns <= 0:
+            raise Error(
+                "WebSocket send deadline must be a positive absolute "
+                "monotonic timestamp"
+            )
+        return self._send(wire^, deadline_ns)
+
+    def _send(
+        mut self, var wire: List[UInt8], deadline_ns: Int64
+    ) raises -> Bool:
         self.control[].sync.lock()
         if self.is_stopping():
             var message = self.control[].failure_message.copy()
@@ -363,6 +486,9 @@ struct _WsDuplexState(Movable):
             raise NetworkError(
                 message if message != "" else "WebSocket duplex is stopped"
             )
+        if deadline_ns != 0 and monotonic_now_ns() >= deadline_ns:
+            self.control[].sync.unlock()
+            return False
         if (
             _load_i64(self.pending_command_id) != 0
             or _load_i64(self.active_command_id) != 0
@@ -383,19 +509,31 @@ struct _WsDuplexState(Movable):
             pass
 
         self.control[].sync.lock()
-        while (
-            self.load_completed_command_id() < command_id
-            and not self.is_stopping()
-        ):
-            self.control[].sync.wait()
-        if self.load_completed_command_id() >= command_id:
-            self.control[].sync.unlock()
-            return
-        var message = self.control[].failure_message.copy()
-        self.control[].sync.unlock()
-        raise NetworkError(
-            message if message != "" else "WebSocket send interrupted"
-        )
+        while True:
+            var now_ns = monotonic_now_ns() if deadline_ns != 0 else Int64(0)
+            var wake = _classify_send_wake(
+                self.load_completed_command_id(),
+                command_id,
+                self.is_stopping(),
+                now_ns,
+                deadline_ns,
+            )
+            if wake == _SEND_WAKE_COMPLETED:
+                self.control[].sync.unlock()
+                return True
+            if wake == _SEND_WAKE_STOPPED:
+                var message = self.control[].failure_message.copy()
+                self.control[].sync.unlock()
+                raise NetworkError(
+                    message if message != "" else "WebSocket send interrupted"
+                )
+            if wake == _SEND_WAKE_DEADLINE:
+                self.control[].sync.unlock()
+                return False
+            if deadline_ns == 0:
+                self.control[].sync.wait()
+            else:
+                _ = self.control[].sync.wait_until(deadline_ns)
 
     def take_pending(mut self) -> Optional[_WsWriteCommand]:
         """Move one queued command into the owner loop."""
@@ -462,14 +600,40 @@ struct WsSender(Movable):
         """Send one masked UTF-8 text frame."""
         self.send_frame(WsFrame.text(message))
 
+    def send_text_until(
+        mut self, message: String, deadline_ns: Int64
+    ) raises -> Bool:
+        """Send text through an absolute monotonic publication deadline."""
+        return self.send_frame_until(WsFrame.text(message), deadline_ns)
+
     def send_binary(mut self, data: List[UInt8]) raises:
         """Send one masked binary frame."""
         self.send_frame(WsFrame.binary(data))
+
+    def send_binary_until(
+        mut self, data: List[UInt8], deadline_ns: Int64
+    ) raises -> Bool:
+        """Send binary data through a monotonic publication deadline."""
+        return self.send_frame_until(WsFrame.binary(data), deadline_ns)
 
     def send_frame(mut self, frame: WsFrame) raises:
         """Send one frame through the receiver-owned stream."""
         var wire = _encode_client_frame(frame)
         self._shared[].send(wire^)
+
+    def send_frame_until(
+        mut self, frame: WsFrame, deadline_ns: Int64
+    ) raises -> Bool:
+        """Send one frame through an absolute monotonic deadline.
+
+        Returns ``True`` only when full publication is observed under the
+        duplex mutex. ``False`` means publication was not observed when the
+        deadline won. The command may finish racing that observation, so the
+        caller MUST immediately shut down the connection after ``False`` and
+        must never attempt another send.
+        """
+        var wire = _encode_client_frame(frame)
+        return self._shared[].send_until(wire^, deadline_ns)
 
 
 struct WsShutdown(Movable):

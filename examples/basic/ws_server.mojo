@@ -34,6 +34,7 @@ from flare.ws.server import (
     _send_upgrade_response,
     _compute_accept_srv,
 )
+from flare.ws._transport import _WsStream
 from flare.net import SocketAddr
 from flare.tcp import TcpStream
 
@@ -152,10 +153,11 @@ def accept_and_upgrade(
     """
     var server_stream = srv._listener.accept()
     var peer = server_stream.peer_addr()
-    var req = _read_upgrade_request(server_stream)
+    var stream = _WsStream(server_stream^)
+    var req = _read_upgrade_request(stream)
     var accept = _compute_accept_srv(req.key)
-    _send_upgrade_response(server_stream, accept)
-    return WsConnection(server_stream^, peer, req^)
+    _send_upgrade_response(stream, accept)
+    return WsConnection(stream^, peer, req^)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

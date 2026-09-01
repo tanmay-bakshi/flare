@@ -11,6 +11,7 @@ from flare.ws import (
     WsClient, WsConnectAttempt, WsServer, WsServerRuntime, WsServerStop,
     WsDuplex,
     WsSender, WsReceiver, WsShutdown,
+    WsUpgradeRequest, WsUpgradeDecision, WsUpgradeGuard,
     WsFrame, WsOpcode, WsCloseCode,
     WsProtocolError, WsHandshakeError,
 )
@@ -32,6 +33,9 @@ from flare.ws import (
   subprotocol, and stoppable-runtime surfaces. Its consuming `serve_stoppable`
   path returns a linear `WsServerRuntime` and an independent `WsServerStop`
   admission fence.
+- `WsUpgradeGuard` — Per-route HTTP Upgrade authorization over the raw
+  request-target and duplicate-preserving header sequence, returning a closed
+  allow or HTTP-error refusal decision before subprotocol negotiation.
 - `WsFrame` — A single WebSocket frame: `text`, `binary`, `ping`, `pong`, `close`.
 - `WsOpcode` — Opcode byte constants (`TEXT`, `BINARY`, `PING`, `PONG`, `CLOSE`).
 - `WsCloseCode` — Close status code constants (`NORMAL`, `GOING_AWAY`, …).
@@ -144,6 +148,8 @@ from .server import (
     WsServerRuntime,
     WsConnection,
     WsUpgradeRequest,
+    WsUpgradeDecision,
+    WsUpgradeGuard,
 )
 from .client_h2 import WsOverH2Stream, bootstrap_ws_over_h2
 from .server_h2 import WsOverH2ServerStream, WsH2Handler

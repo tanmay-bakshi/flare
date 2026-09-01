@@ -16,12 +16,24 @@ from flare.runtime._libc_time import monotonic_now_ms
 from flare.runtime._thread import ThreadHandle, _OpaquePtr
 from flare.tcp import TcpListener, TcpStream
 from flare.utils import usleep
-from flare.ws import WsClient, WsConnection, WsHandler, WsOpcode
+from flare.ws import (
+    WsClient,
+    WsConnection,
+    WsHandler,
+    WsOpcode,
+    WsUpgradeDecision,
+    WsUpgradeGuard,
+    WsUpgradeRequest,
+)
 from flare.ws._duplex import _DuplexSync
 from flare.http_ws.server import _HttpWsServerState
 
 
 comptime _WAIT_MS = 2_000
+comptime _GUARD_ALLOW = 0
+comptime _GUARD_REFUSE = 1
+comptime _GUARD_RAISE = 2
+comptime _GUARD_BLOCK = 3
 
 
 def _null_opaque_pointer() -> _OpaquePtr:
@@ -139,10 +151,136 @@ struct _WebSocketHandler(Copyable, Movable, WsHandler):
         self.probe[].leave_ws()
 
 
+struct _UpgradeGuardProbe(Movable):
+    """Mutex-guarded observations made before Upgrade negotiation."""
+
+    var _sync: _DuplexSync
+    var _calls: Int
+    var _target: String
+    var _duplicate_count: Int
+    var _duplicate_values: String
+    var _may_return: Bool
+
+    def __init__(out self):
+        self._sync = _DuplexSync()
+        self._calls = 0
+        self._target = ""
+        self._duplicate_count = 0
+        self._duplicate_values = ""
+        self._may_return = False
+
+    def observe(mut self, request: WsUpgradeRequest):
+        var duplicate_count = 0
+        var duplicate_values = String("")
+        for index in range(len(request.header_names)):
+            if request.header_names[index] != "x-guard-value":
+                continue
+            if duplicate_count > 0:
+                duplicate_values += "|"
+            duplicate_values += request.header_values[index]
+            duplicate_count += 1
+
+        self._sync.lock()
+        self._calls += 1
+        self._target = request.target
+        self._duplicate_count = duplicate_count
+        self._duplicate_values = duplicate_values^
+        self._sync.unlock()
+
+    def allow_return(mut self):
+        self._sync.lock()
+        self._may_return = True
+        self._sync.unlock()
+
+    def may_return(mut self) -> Bool:
+        self._sync.lock()
+        var result = self._may_return
+        self._sync.unlock()
+        return result
+
+    def calls(mut self) -> Int:
+        self._sync.lock()
+        var result = self._calls
+        self._sync.unlock()
+        return result
+
+    def target(mut self) -> String:
+        self._sync.lock()
+        var result = self._target.copy()
+        self._sync.unlock()
+        return result^
+
+    def duplicate_count(mut self) -> Int:
+        self._sync.lock()
+        var result = self._duplicate_count
+        self._sync.unlock()
+        return result
+
+    def duplicate_values(mut self) -> String:
+        self._sync.lock()
+        var result = self._duplicate_values.copy()
+        self._sync.unlock()
+        return result^
+
+
+@fieldwise_init
+struct _UpgradeGuard(Copyable, Movable, WsUpgradeGuard):
+    """Scripted guard covering every closed decision and the stop race."""
+
+    var mode: Int
+    var probe: ArcPointer[_UpgradeGuardProbe]
+
+    def decide(mut self, request: WsUpgradeRequest) raises -> WsUpgradeDecision:
+        self.probe[].observe(request)
+        if self.mode == _GUARD_BLOCK:
+            while not self.probe[].may_return():
+                usleep(1_000)
+            return WsUpgradeDecision.allow()
+        if self.mode == _GUARD_ALLOW:
+            return WsUpgradeDecision.allow()
+        if self.mode == _GUARD_REFUSE:
+            return WsUpgradeDecision.refuse(401)
+        if self.mode == _GUARD_RAISE:
+            raise Error("intentional Upgrade guard failure")
+        raise Error("invalid scripted Upgrade guard mode")
+
+
 def _routes(probe: ArcPointer[_Probe]) raises -> HttpWsRoutes[_HttpHandler]:
     var routes = HttpWsRoutes[_HttpHandler](_HttpHandler(probe.copy()))
     routes.websocket("/ws/a", _WebSocketHandler(1, probe.copy()))
     routes.websocket("/ws/b", _WebSocketHandler(2, probe.copy()))
+    return routes^
+
+
+def _single_guard_routes(
+    probe: ArcPointer[_Probe],
+    guard_probe: ArcPointer[_UpgradeGuardProbe],
+    path: String,
+    mode: Int,
+    subprotocols: List[String] = List[String](),
+) raises -> HttpWsRoutes[_HttpHandler]:
+    var routes = HttpWsRoutes[_HttpHandler](_HttpHandler(probe.copy()))
+    routes.websocket_guarded(
+        path,
+        _WebSocketHandler(1, probe),
+        _UpgradeGuard(mode, guard_probe),
+        subprotocols,
+    )
+    return routes^
+
+
+def _mixed_guard_routes(
+    probe: ArcPointer[_Probe],
+    guard_probe: ArcPointer[_UpgradeGuardProbe],
+    mode: Int,
+) raises -> HttpWsRoutes[_HttpHandler]:
+    var routes = HttpWsRoutes[_HttpHandler](_HttpHandler(probe.copy()))
+    routes.websocket("/plain", _WebSocketHandler(1, probe.copy()))
+    routes.websocket_guarded(
+        "/guard",
+        _WebSocketHandler(2, probe),
+        _UpgradeGuard(mode, guard_probe),
+    )
     return routes^
 
 
@@ -172,7 +310,9 @@ def _send_get(mut stream: TcpStream, path: String) raises:
     stream.write_all(Span[UInt8, _](request.as_bytes()))
 
 
-def _send_upgrade(mut stream: TcpStream, path: String) raises:
+def _send_upgrade_with_headers(
+    mut stream: TcpStream, path: String, extra_headers: String
+) raises:
     var request = (
         "GET "
         + path
@@ -182,9 +322,14 @@ def _send_upgrade(mut stream: TcpStream, path: String) raises:
         + "Connection: Upgrade\r\n"
         + "Sec-WebSocket-Version: 13\r\n"
         + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        + extra_headers
         + "\r\n"
     )
     stream.write_all(Span[UInt8, _](request.as_bytes()))
+
+
+def _send_upgrade(mut stream: TcpStream, path: String) raises:
+    _send_upgrade_with_headers(stream, path, "")
 
 
 def _try_read(mut stream: TcpStream) -> String:
@@ -247,6 +392,16 @@ def _raw_upgrade(port: UInt16, path: String) raises -> String:
     return response^
 
 
+def _raw_upgrade_with_headers(
+    port: UInt16, path: String, extra_headers: String
+) raises -> String:
+    var stream = TcpStream.connect(SocketAddr.localhost(port))
+    _send_upgrade_with_headers(stream, path, extra_headers)
+    var response = _read_response(stream)
+    stream.close()
+    return response^
+
+
 def _late_upgrade(port: UInt16, path: String) -> String:
     try:
         return _raw_upgrade(port, path)
@@ -265,6 +420,22 @@ def _wait_for_active(probe: ArcPointer[_Probe], expected: Int) raises:
         + String(expected)
         + ", got "
         + String(probe[].ws_active())
+    )
+
+
+def _wait_for_guard_calls(
+    probe: ArcPointer[_UpgradeGuardProbe], expected: Int
+) raises:
+    var deadline = monotonic_now_ms() + _WAIT_MS
+    while monotonic_now_ms() < deadline:
+        if probe[].calls() == expected:
+            return
+        usleep(1_000)
+    raise Error(
+        "timed out waiting for Upgrade guard calls: expected "
+        + String(expected)
+        + ", got "
+        + String(probe[].calls())
     )
 
 
@@ -372,6 +543,287 @@ def test_dispatch_matrix_and_route_identity() raises:
     assert_equal(probe[].http_calls(), 1)
     assert_equal(probe[].ws_a_entered(), 1)
     assert_equal(probe[].ws_b_entered(), 1)
+
+
+def test_upgrade_guard_allows_before_handler_entry() raises:
+    var probe = ArcPointer[_Probe](_Probe())
+    var guard_probe = ArcPointer[_UpgradeGuardProbe](_UpgradeGuardProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=2,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var runtime = server^.serve_stoppable(
+        _single_guard_routes(
+            probe.copy(), guard_probe.copy(), "/guard", _GUARD_ALLOW
+        )
+    )
+    try:
+        var client = WsClient.connect(_url(port, "/guard"))
+        client.send_text("guarded")
+        assert_equal(
+            client.recv(max_message_bytes=65_536).text_payload(), "route=1"
+        )
+        client.close()
+        _wait_for_active(probe.copy(), 0)
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+    runtime^.stop_and_join()
+
+    assert_equal(guard_probe[].calls(), 1)
+    assert_equal(probe[].ws_a_entered(), 1)
+
+
+def test_upgrade_guard_refuses_empty_401_without_handler() raises:
+    with assert_raises():
+        _ = WsUpgradeDecision.refuse(399)
+    with assert_raises():
+        _ = WsUpgradeDecision.refuse(600)
+
+    var probe = ArcPointer[_Probe](_Probe())
+    var guard_probe = ArcPointer[_UpgradeGuardProbe](_UpgradeGuardProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=2,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var runtime = server^.serve_stoppable(
+        _single_guard_routes(
+            probe.copy(), guard_probe.copy(), "/guard", _GUARD_REFUSE
+        )
+    )
+    var response: String
+    try:
+        response = _raw_upgrade(port, "/guard")
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+    runtime^.stop_and_join()
+
+    assert_true(" 401 " in response, response)
+    assert_true("Content-Length: 0" in response, response)
+    assert_false(" 101 " in response, response)
+    assert_equal(guard_probe[].calls(), 1)
+    assert_equal(probe[].ws_entered(), 0)
+
+
+def test_upgrade_guard_is_scoped_to_its_exact_route() raises:
+    var probe = ArcPointer[_Probe](_Probe())
+    var guard_probe = ArcPointer[_UpgradeGuardProbe](_UpgradeGuardProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=2,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var runtime = server^.serve_stoppable(
+        _mixed_guard_routes(probe.copy(), guard_probe.copy(), _GUARD_REFUSE)
+    )
+    var refused: String
+    try:
+        var plain = WsClient.connect(_url(port, "/plain"))
+        plain.send_text("plain")
+        assert_equal(
+            plain.recv(max_message_bytes=65_536).text_payload(), "route=1"
+        )
+        plain.close()
+        _wait_for_active(probe.copy(), 0)
+        assert_equal(guard_probe[].calls(), 0)
+        refused = _raw_upgrade(port, "/guard")
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+    runtime^.stop_and_join()
+
+    assert_true(" 401 " in refused, refused)
+    assert_equal(guard_probe[].calls(), 1)
+    assert_equal(probe[].ws_a_entered(), 1)
+    assert_equal(probe[].ws_b_entered(), 0)
+
+
+def test_upgrade_guard_sees_raw_target_and_duplicate_headers() raises:
+    var probe = ArcPointer[_Probe](_Probe())
+    var guard_probe = ArcPointer[_UpgradeGuardProbe](_UpgradeGuardProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=2,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var runtime = server^.serve_stoppable(
+        _single_guard_routes(
+            probe.copy(),
+            guard_probe.copy(),
+            "/guard/é%2Fraw",
+            _GUARD_ALLOW,
+        )
+    )
+    var response: String
+    try:
+        response = _raw_upgrade_with_headers(
+            port,
+            "/guard/é%2Fraw",
+            "X-Guard-Value: first\r\nX-Guard-Value: second\r\n",
+        )
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+    runtime^.stop_and_join()
+
+    assert_true(" 101 " in response, response)
+    assert_equal(guard_probe[].target(), "/guard/é%2Fraw")
+    assert_equal(guard_probe[].duplicate_count(), 2)
+    assert_equal(guard_probe[].duplicate_values(), "first|second")
+    assert_equal(probe[].ws_a_entered(), 1)
+
+
+def test_upgrade_guard_failure_returns_empty_500() raises:
+    var probe = ArcPointer[_Probe](_Probe())
+    var guard_probe = ArcPointer[_UpgradeGuardProbe](_UpgradeGuardProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=2,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var runtime = server^.serve_stoppable(
+        _single_guard_routes(
+            probe.copy(), guard_probe.copy(), "/guard", _GUARD_RAISE
+        )
+    )
+    var response: String
+    try:
+        response = _raw_upgrade(port, "/guard")
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+    runtime^.stop_and_join()
+
+    assert_true(" 500 " in response, response)
+    assert_true("Content-Length: 0" in response, response)
+    assert_false(" 101 " in response, response)
+    assert_equal(guard_probe[].calls(), 1)
+    assert_equal(probe[].ws_entered(), 0)
+
+
+def test_saturation_refuses_before_upgrade_guard() raises:
+    var probe = ArcPointer[_Probe](_Probe())
+    var guard_probe = ArcPointer[_UpgradeGuardProbe](_UpgradeGuardProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=1,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var runtime = server^.serve_stoppable(
+        _mixed_guard_routes(probe.copy(), guard_probe.copy(), _GUARD_ALLOW)
+    )
+    var saturated: String
+    try:
+        var holding = WsClient.connect(_url(port, "/plain"))
+        _wait_for_active(probe.copy(), 1)
+        saturated = _raw_upgrade(port, "/guard")
+        assert_equal(guard_probe[].calls(), 0)
+        holding.close()
+        _wait_for_active(probe.copy(), 0)
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+    runtime^.stop_and_join()
+
+    assert_true(" 503 " in saturated, saturated)
+    assert_false(" 101 " in saturated, saturated)
+    assert_equal(guard_probe[].calls(), 0)
+
+
+def test_stop_winning_during_upgrade_guard_publishes_nothing() raises:
+    var probe = ArcPointer[_Probe](_Probe())
+    var guard_probe = ArcPointer[_UpgradeGuardProbe](_UpgradeGuardProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=2,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var runtime = server^.serve_stoppable(
+        _single_guard_routes(
+            probe.copy(), guard_probe.copy(), "/guard", _GUARD_BLOCK
+        )
+    )
+    var stop: HttpWsServerStop
+    try:
+        stop = runtime.take_stop()
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+
+    var stream = Optional[TcpStream]()
+    try:
+        stream = TcpStream.connect(SocketAddr.localhost(port))
+        _send_upgrade(stream.value(), "/guard")
+        _wait_for_guard_calls(guard_probe.copy(), 1)
+    except error:
+        guard_probe[].allow_return()
+        stop.stop()
+        runtime^.join()
+        if stream:
+            stream.value().close()
+        raise error^
+    stop.stop()
+    guard_probe[].allow_return()
+    runtime^.join()
+    var response = _read_response(stream.value(), timeout_ms=200)
+    stream.value().close()
+
+    assert_equal(response, "")
+    assert_equal(probe[].ws_entered(), 0)
+
+
+def test_upgrade_guard_refusal_precedes_subprotocol_parsing() raises:
+    var probe = ArcPointer[_Probe](_Probe())
+    var guard_probe = ArcPointer[_UpgradeGuardProbe](_UpgradeGuardProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=2,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var protocols: List[String] = ["echo.1"]
+    var runtime = server^.serve_stoppable(
+        _single_guard_routes(
+            probe.copy(),
+            guard_probe.copy(),
+            "/guard",
+            _GUARD_REFUSE,
+            protocols,
+        )
+    )
+    var response: String
+    try:
+        response = _raw_upgrade_with_headers(
+            port, "/guard", "Sec-WebSocket-Protocol: ,\r\n"
+        )
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+    runtime^.stop_and_join()
+
+    assert_true(" 401 " in response, response)
+    assert_false(" 400 " in response, response)
+    assert_false(" 101 " in response, response)
+    assert_equal(guard_probe[].calls(), 1)
+    assert_equal(probe[].ws_entered(), 0)
 
 
 struct _OverlapProbe(Movable):
@@ -934,6 +1386,14 @@ def test_worker_error_surfaces_only_from_join() raises:
 def main() raises:
     test_requires_positive_resource_bounds()
     test_dispatch_matrix_and_route_identity()
+    test_upgrade_guard_allows_before_handler_entry()
+    test_upgrade_guard_refuses_empty_401_without_handler()
+    test_upgrade_guard_is_scoped_to_its_exact_route()
+    test_upgrade_guard_sees_raw_target_and_duplicate_headers()
+    test_upgrade_guard_failure_returns_empty_500()
+    test_saturation_refuses_before_upgrade_guard()
+    test_stop_winning_during_upgrade_guard_publishes_nothing()
+    test_upgrade_guard_refusal_precedes_subprotocol_parsing()
     test_stop_reaches_split_before_preadmission_release()
     test_stale_preadmission_release_cannot_clear_reused_slot()
     test_concurrent_websockets_do_not_block_http()
@@ -945,4 +1405,4 @@ def main() raises:
     test_idle_and_stalled_header_stop_join_promptly()
     test_handler_failure_isolated_to_one_connection()
     test_worker_error_surfaces_only_from_join()
-    print("test_http_ws_server: 13 passed")
+    print("test_http_ws_server: 21 passed")

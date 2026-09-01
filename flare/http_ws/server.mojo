@@ -441,15 +441,51 @@ def _serve_connection[
         return
 
     var is_upgrade = _is_websocket_upgrade(request)
-    var ws_index = context.routes._ws_index(request.url)
     var http_ws_index = context.routes._ws_index(_path_only(request.url))
 
-    if is_upgrade and ws_index >= 0:
+    if is_upgrade:
         var ws_request: WsUpgradeRequest
+        try:
+            ws_request = _parse_ws_upgrade_bytes(Span[UInt8, _](header.bytes))
+        except:
+            if context.state[].claim_after_parse(context.slot, fd):
+                _send_status(
+                    context.stream.value(), Status.BAD_REQUEST, "Bad Request"
+                )
+            return
+
+        var ws_index = context.routes._ws_index(ws_request.target)
+        if ws_index < 0:
+            if context.state[].claim_after_parse(context.slot, fd):
+                _send_status(
+                    context.stream.value(), Status.BAD_REQUEST, "Bad Request"
+                )
+            return
+
+        var refusal_status = 0
+        if context.routes._ws_has_guard(ws_index):
+            try:
+                var decision = context.routes._decide_ws_upgrade(
+                    ws_index, ws_request
+                )
+                if not decision.is_allowed():
+                    refusal_status = decision.refusal_status()
+            except:
+                if context.state[].claim_after_parse(context.slot, fd):
+                    _send_status(
+                        context.stream.value(),
+                        Status.INTERNAL_SERVER_ERROR,
+                        "Internal Server Error",
+                    )
+                return
+        if refusal_status != 0:
+            if context.state[].claim_after_parse(context.slot, fd):
+                _send_status(context.stream.value(), refusal_status, "")
+            return
+
         var subprotocol: Optional[String]
         var accept: String
         try:
-            ws_request = _parse_ws_upgrade_bytes(Span[UInt8, _](header.bytes))
             subprotocol = _negotiate_subprotocol(
                 ws_request, context.routes._ws_subprotocols(ws_index)
             )
@@ -481,10 +517,7 @@ def _serve_connection[
 
     if not context.state[].claim_after_parse(context.slot, fd):
         return
-    if is_upgrade:
-        _send_status(context.stream.value(), Status.BAD_REQUEST, "Bad Request")
-        return
-    if not is_upgrade and http_ws_index >= 0:
+    if http_ws_index >= 0:
         _send_status(
             context.stream.value(),
             426,

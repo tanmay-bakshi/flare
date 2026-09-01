@@ -189,7 +189,9 @@ struct WsUpgradeRequest(Copyable, Movable):
             optional query string (empty when malformed).
         key: The ``Sec-WebSocket-Key`` header value.
         header_names: Every header name in arrival order, lowercased.
-        header_values: Header values parallel to ``header_names``, verbatim.
+        header_values: Header values parallel to ``header_names``, preserving
+            every field instance and byte after HTTP optional whitespace is
+            trimmed.
     """
 
     var method: String
@@ -228,6 +230,72 @@ struct WsUpgradeRequest(Copyable, Movable):
             if self.header_names[i] == wanted:
                 return self.header_values[i].copy()
         return default.copy()
+
+
+struct WsUpgradeDecision(Copyable, Movable):
+    """Closed result returned by a :class:`WsUpgradeGuard`.
+
+    Construct decisions with :meth:`allow` or :meth:`refuse`. Refusal status
+    codes are restricted to HTTP client and server errors so a guard cannot
+    accidentally publish a success or informational response in place of an
+    Upgrade.
+    """
+
+    var _action: Int
+    var _status: Int
+
+    comptime _ALLOW: Int = 0
+    comptime _REFUSE: Int = 1
+
+    def __init__(out self):
+        self._action = Self._ALLOW
+        self._status = 0
+
+    def __init__(out self, refusal_status: Int) raises:
+        if refusal_status < 400 or refusal_status > 599:
+            raise Error("WebSocket Upgrade refusal status must be 400..599")
+        self._action = Self._REFUSE
+        self._status = refusal_status
+
+    @staticmethod
+    def allow() -> Self:
+        """Allow negotiation of the selected route to continue."""
+        return Self()
+
+    @staticmethod
+    def refuse(status: Int) raises -> Self:
+        """Refuse the Upgrade with one empty HTTP error response."""
+        return Self(status)
+
+    def is_allowed(self) raises -> Bool:
+        """Return the selected arm, rejecting an invalid constructed value."""
+        if self._action == Self._ALLOW:
+            return True
+        if self._action == Self._REFUSE:
+            if self._status < 400 or self._status > 599:
+                raise Error("invalid WebSocket Upgrade refusal status")
+            return False
+        raise Error("invalid WebSocket Upgrade decision")
+
+    def refusal_status(self) raises -> Int:
+        """Return the refusal status for a validated refusal decision."""
+        if self.is_allowed():
+            raise Error("allowed WebSocket Upgrade has no refusal status")
+        return self._status
+
+
+trait WsUpgradeGuard(Copyable, Deinitable, Movable):
+    """Per-route authorization performed before subprotocol negotiation.
+
+    The request exposes the exact request-target and every header in arrival
+    order. Implementations may therefore apply signature schemes without a
+    normalized target or duplicate-collapsing header map changing the signed
+    input.
+    """
+
+    def decide(mut self, request: WsUpgradeRequest) raises -> WsUpgradeDecision:
+        """Allow the Upgrade or refuse it with an HTTP error status."""
+        ...
 
 
 def _parse_request_line(line: String) -> Tuple[String, String]:
@@ -275,7 +343,7 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> WsUpgradeRequest:
     var pos = 0
 
     def read_line(data: Span[UInt8, _], mut pos: Int) raises -> String:
-        var line = String(capacity=256)
+        var start = pos
         var saw_cr = False
         while pos < len(data):
             var c = data[pos]
@@ -288,10 +356,9 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> WsUpgradeRequest:
             if c == 10:
                 if not saw_cr:
                     raise NetworkError("bare LF in WebSocket Upgrade headers")
-                return line^
+                return String(unsafe_from_utf8=data[start : pos - 2])
             if saw_cr:
                 raise NetworkError("bare CR in WebSocket Upgrade headers")
-            line += chr(Int(c))
         raise NetworkError("truncated WebSocket Upgrade header line")
 
     var method: String

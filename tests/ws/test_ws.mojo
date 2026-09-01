@@ -29,6 +29,7 @@ from flare.ws import (
     WsConnection,
 )
 from flare.ws.frame import _encode_client_frame
+from flare.ws._transport import _WsStream
 from flare.tcp import TcpStream, TcpListener
 from flare.net import SocketAddr
 from flare.tls import TlsConfig
@@ -505,8 +506,9 @@ def test_ws_server_text_echo_loopback() raises:
     _send_upgrade_request_raw(raw_client, "localhost")
 
     # ── Server: accept + handshake
-    var server_stream = srv._listener.accept()
-    var srv_peer = server_stream.peer_addr()
+    var accepted = srv._listener.accept()
+    var srv_peer = accepted.peer_addr()
+    var server_stream = _WsStream(accepted^)
     var req = _read_upgrade_request(server_stream)
     var accept = _compute_accept_srv(req.key)
     _send_upgrade_response(server_stream, accept)
@@ -555,8 +557,9 @@ def test_ws_server_binary_echo_loopback() raises:
     var raw_client = TcpStream.connect(SocketAddr.localhost(port))
     _send_upgrade_request_raw(raw_client, "localhost")
 
-    var server_stream = srv._listener.accept()
-    var srv_peer2 = server_stream.peer_addr()
+    var accepted = srv._listener.accept()
+    var srv_peer2 = accepted.peer_addr()
+    var server_stream = _WsStream(accepted^)
     var req = _read_upgrade_request(server_stream)
     var accept = _compute_accept_srv(req.key)
     _send_upgrade_response(server_stream, accept)
@@ -603,8 +606,9 @@ def test_ws_server_unmasked_frame_rejected() raises:
     var raw_client = TcpStream.connect(SocketAddr.localhost(port))
     _send_upgrade_request_raw(raw_client, "localhost")
 
-    var server_stream = srv._listener.accept()
-    var srv_peer3 = server_stream.peer_addr()
+    var accepted = srv._listener.accept()
+    var srv_peer3 = accepted.peer_addr()
+    var server_stream = _WsStream(accepted^)
     var req = _read_upgrade_request(server_stream)
     var accept = _compute_accept_srv(req.key)
     _send_upgrade_response(server_stream, accept)

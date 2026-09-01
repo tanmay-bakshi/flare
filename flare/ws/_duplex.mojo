@@ -1374,9 +1374,9 @@ struct WsReceiver(Movable):
         try:
             var complete = WsFrame(opcode=WsOpcode.TEXT, payload=payload^)
             return WsMessage(complete.text_payload())
-        except error:
-            self._terminate(String(error))
-            raise error^
+        except:
+            self._reject(WsCloseCode.INVALID_PAYLOAD, "invalid_utf8")
+            return WsMessage("")
 
 
 struct WsDuplex(Movable):

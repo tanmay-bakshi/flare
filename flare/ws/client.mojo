@@ -1339,8 +1339,12 @@ struct WsClient(Movable):
                 payload.append(byte)
         if opcode == WsOpcode.BINARY:
             return WsMessage(payload^)
-        var complete = WsFrame(opcode=WsOpcode.TEXT, payload=payload^)
-        return WsMessage(complete.text_payload())
+        try:
+            var complete = WsFrame(opcode=WsOpcode.TEXT, payload=payload^)
+            return WsMessage(complete.text_payload())
+        except:
+            self._reject_inbound(WsCloseCode.INVALID_PAYLOAD, "invalid_utf8")
+            return WsMessage("")
 
     # ── Context manager ───────────────────────────────────────────────────────
 

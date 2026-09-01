@@ -1,5 +1,6 @@
 """Message-bound, server-split, and bounded-close WebSocket regressions."""
 
+from std.memory import ArcPointer
 from std.memory.alloc import unsafe_alloc
 from std.testing import assert_equal, assert_false, assert_raises, assert_true
 
@@ -10,6 +11,7 @@ from flare.tcp import TcpListener, TcpStream
 from flare.utils import usleep
 from flare.ws import (
     WsCloseCode,
+    WsClient,
     WsConnection,
     WsDuplex,
     WsFrame,
@@ -18,7 +20,7 @@ from flare.ws import (
     WsShutdown,
     WsUpgradeRequest,
 )
-from flare.ws._duplex import _split_stream
+from flare.ws._duplex import _split_stream, _WsControl
 from flare.ws._transport import _WsStream
 from flare.ws.frame import _encode_client_frame
 
@@ -69,6 +71,15 @@ def _close_code(frame: WsFrame) -> UInt16:
     return (UInt16(frame.payload[0]) << 8) | UInt16(frame.payload[1])
 
 
+def _close_reason(frame: WsFrame) -> String:
+    if frame.opcode != WsOpcode.CLOSE or len(frame.payload) <= 2:
+        return ""
+    var reason = List[UInt8](capacity=len(frame.payload) - 2)
+    for index in range(2, len(frame.payload)):
+        reason.append(frame.payload[index])
+    return String(unsafe_from_utf8=Span[UInt8, _](reason))
+
+
 def _unmasked_header(
     opcode: UInt8, length: Int, fin: Bool = True
 ) -> List[UInt8]:
@@ -98,6 +109,104 @@ def _expect_oversize(var receiver: WsReceiver, var peer: TcpStream) raises:
     var close = _read_frame(peer)
     assert_true("message_too_big" in message, message)
     assert_equal(_close_code(close), WsCloseCode.MESSAGE_TOO_BIG)
+
+
+def _expect_invalid_utf8(
+    var receiver: WsReceiver,
+    var peer: TcpStream,
+    masked_close: Bool,
+) raises:
+    var message = String("")
+    try:
+        _ = receiver.recv_message()
+    except error:
+        message = String(error)
+    peer.set_recv_timeout(1_000)
+    var close = _read_frame(peer)
+    assert_true("invalid_utf8" in message, message)
+    assert_equal(close.opcode, WsOpcode.CLOSE)
+    assert_equal(close.masked, masked_close)
+    assert_equal(_close_code(close), WsCloseCode.INVALID_PAYLOAD)
+    assert_equal(_close_reason(close), "invalid_utf8")
+
+
+def _invalid_text_fragments(masked: Bool) raises -> List[UInt8]:
+    var first = WsFrame(
+        opcode=WsOpcode.TEXT,
+        payload=[UInt8(0xE2)],
+        fin=False,
+    )
+    var continuation = WsFrame(
+        opcode=WsOpcode.CONTINUATION,
+        payload=[UInt8(0x28), UInt8(0xA1)],
+    )
+    var wire = _encode_client_frame(first) if masked else first.encode(
+        mask=False
+    )
+    var tail = _encode_client_frame(
+        continuation
+    ) if masked else continuation.encode(mask=False)
+    for byte in tail:
+        wire.append(byte)
+    return wire^
+
+
+def test_split_client_rejects_aggregate_invalid_utf8() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var local = TcpStream.connect(listener.local_addr())
+    var peer = listener.accept()
+    var duplex = _split_stream(
+        _WsStream(local^),
+        _CAP,
+        mask_outbound=True,
+        expect_masked_inbound=False,
+    )
+    var receiver = duplex.take_receiver()
+    _ = duplex.take_sender()
+    _ = duplex.take_shutdown()
+
+    var wire = _invalid_text_fragments(masked=False)
+    peer.write_all(Span[UInt8, _](wire))
+    _expect_invalid_utf8(receiver^, peer^, masked_close=True)
+
+
+def test_split_server_rejects_aggregate_invalid_utf8() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var peer = TcpStream.connect(listener.local_addr())
+    var local = listener.accept()
+    var duplex = _split_server(local^, _CAP)
+    var receiver = duplex.take_receiver()
+    _ = duplex.take_sender()
+    _ = duplex.take_shutdown()
+
+    var wire = _invalid_text_fragments(masked=True)
+    peer.write_all(Span[UInt8, _](wire))
+    _expect_invalid_utf8(receiver^, peer^, masked_close=False)
+
+
+def test_unsplit_client_rejects_aggregate_invalid_utf8() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var local = TcpStream.connect(listener.local_addr())
+    var peer = listener.accept()
+    var control = ArcPointer[_WsControl](_WsControl())
+    var stream = _WsStream(local^)
+    assert_true(control[].attach_fd(stream.fd()))
+    var client = WsClient(stream^, "test-key", control)
+
+    var wire = _invalid_text_fragments(masked=False)
+    peer.write_all(Span[UInt8, _](wire))
+    var message = String("")
+    try:
+        _ = client.recv_message(_CAP)
+    except error:
+        message = String(error)
+    peer.set_recv_timeout(1_000)
+    var close = _read_frame(peer)
+    assert_true("invalid_utf8" in message, message)
+    assert_equal(close.opcode, WsOpcode.CLOSE)
+    assert_true(close.masked)
+    assert_equal(_close_code(close), WsCloseCode.INVALID_PAYLOAD)
+    assert_equal(_close_reason(close), "invalid_utf8")
 
 
 def test_client_rejects_declared_oversize_before_payload() raises:
@@ -468,6 +577,9 @@ def test_receiver_thread_can_request_close_without_deadlock() raises:
 
 
 def main() raises:
+    test_split_client_rejects_aggregate_invalid_utf8()
+    test_split_server_rejects_aggregate_invalid_utf8()
+    test_unsplit_client_rejects_aggregate_invalid_utf8()
     test_client_rejects_declared_oversize_before_payload()
     test_server_rejects_declared_oversize_before_payload()
     test_client_counts_fragmented_message_total()

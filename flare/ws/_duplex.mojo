@@ -45,6 +45,9 @@ comptime _SEND_WAKE_WAITING: Int = 0
 comptime _SEND_WAKE_COMPLETED: Int = 1
 comptime _SEND_WAKE_STOPPED: Int = 2
 comptime _SEND_WAKE_DEADLINE: Int = 3
+comptime _OUTBOUND_CONTROL_ID: Int64 = -1
+comptime _OUTBOUND_REQUESTED_CLOSE_ID: Int64 = -2
+comptime _MAX_REACTOR_TIMEOUT_MS: Int = 2_147_483_647
 
 
 def _null_sync_pointer() -> _SyncPointer:
@@ -409,9 +412,8 @@ struct _WsControl(Movable):
         self.sync.unlock()
         return message^
 
-    def stop(mut self, message: String):
-        """Fix terminal state and interrupt whichever connect phase is live."""
-        self.sync.lock()
+    def _stop_locked(mut self, message: String):
+        """Fix terminal state while the caller holds ``sync``."""
         if not self.is_stopping():
             self.failure_message = message
             _store_u8(self.stopping, UInt8(1))
@@ -427,11 +429,20 @@ struct _WsControl(Movable):
             ):
                 _ = _shutdown(self.raw_fd, SHUT_RDWR)
         self.sync.broadcast()
-        self.sync.unlock()
+
+    def _wake_owner(mut self):
+        """Wake the current connection phase after publishing control state."""
         try:
             self.reactor.wakeup()
         except:
             pass
+
+    def stop(mut self, message: String):
+        """Fix terminal state and interrupt whichever connect phase is live."""
+        self.sync.lock()
+        self._stop_locked(message)
+        self.sync.unlock()
+        self._wake_owner()
 
 
 struct _WsDuplexState(Movable):
@@ -448,9 +459,12 @@ struct _WsDuplexState(Movable):
     var expect_masked_inbound: Bool
     var max_message_bytes: Int
     var local_close_started: UInt8
-    var local_close_command_id: Int64
     var local_close_published: UInt8
     var peer_close_received: UInt8
+    var requested_close_deadline_ns: Int64
+    var requested_close_wire: List[UInt8]
+    var requested_close_taken: UInt8
+    var requested_close_timed_out: UInt8
 
     def __init__(
         out self,
@@ -495,9 +509,12 @@ struct _WsDuplexState(Movable):
         self.expect_masked_inbound = expect_masked_inbound
         self.max_message_bytes = max_message_bytes
         self.local_close_started = UInt8(0)
-        self.local_close_command_id = 0
         self.local_close_published = UInt8(0)
         self.peer_close_received = UInt8(0)
+        self.requested_close_deadline_ns = 0
+        self.requested_close_wire = List[UInt8]()
+        self.requested_close_taken = UInt8(0)
+        self.requested_close_timed_out = UInt8(0)
 
     def encode_outbound(self, frame: WsFrame) raises -> List[UInt8]:
         """Encode one frame according to this endpoint's RFC 6455 role."""
@@ -505,18 +522,132 @@ struct _WsDuplexState(Movable):
             return _encode_client_frame(frame)
         return frame.encode(mask=False)
 
-    def begin_local_close(mut self) -> Bool:
-        """Fence later application sends behind the first local CLOSE."""
+    def request_close_within(
+        mut self, timeout_ms: Int, code: UInt16, reason: String
+    ) raises:
+        """Retain the first bounded CLOSE request and wake the stream owner."""
         self.control[].sync.lock()
-        if _load_u8(self.local_close_started) != UInt8(0):
+        if _load_u8(self.local_close_started) != UInt8(0) or self.is_stopping():
             self.control[].sync.unlock()
-            return False
-        if self.is_stopping():
+            return
+        var deadline_ns: Int64
+        var wire: List[UInt8]
+        try:
+            deadline_ns = _send_deadline_ns(timeout_ms)
+            var frame = WsFrame.close(code, reason)
+            wire = self.encode_outbound(frame)
+        except error:
             self.control[].sync.unlock()
-            return False
+            raise error^
+        self.requested_close_wire = wire^
+        _store_i64(self.requested_close_deadline_ns, deadline_ns)
         _store_u8(self.local_close_started, UInt8(1))
+        self.control[].sync.broadcast()
         self.control[].sync.unlock()
-        return True
+        self.control[]._wake_owner()
+
+    def take_requested_close(mut self) -> Optional[List[UInt8]]:
+        """Move the retained CLOSE into the owner after earlier sends drain."""
+        self.control[].sync.lock()
+        if (
+            _load_i64(self.requested_close_deadline_ns) == 0
+            or _load_u8(self.requested_close_taken) != UInt8(0)
+            or _load_i64(self.pending_command_id) != 0
+            or _load_i64(self.active_command_id) != 0
+            or self.is_stopping()
+        ):
+            self.control[].sync.unlock()
+            return Optional[List[UInt8]]()
+        var wire = self.requested_close_wire^
+        self.requested_close_wire = List[UInt8]()
+        _store_u8(self.requested_close_taken, UInt8(1))
+        self.control[].sync.unlock()
+        return Optional[List[UInt8]](wire^)
+
+    def note_requested_close_published(mut self):
+        """Publish that every retained CLOSE byte reached the transport."""
+        self.control[].sync.lock()
+        _store_u8(self.local_close_published, UInt8(1))
+        self.control[].sync.broadcast()
+        self.control[].sync.unlock()
+
+    def requested_close_poll_timeout_ms(mut self) -> Int:
+        """Return the bounded owner wait imposed by a retained CLOSE."""
+        self.control[].sync.lock()
+        var deadline_ns = _load_i64(self.requested_close_deadline_ns)
+        var terminal = (
+            deadline_ns == 0
+            or _load_u8(self.peer_close_received) != UInt8(0)
+            or self.is_stopping()
+        )
+        self.control[].sync.unlock()
+        if terminal:
+            return -1
+        var remaining_ns = deadline_ns - monotonic_now_ns()
+        if remaining_ns <= 0:
+            return 0
+        var timeout_ms = Int(remaining_ns // 1_000_000)
+        if remaining_ns % 1_000_000 != 0:
+            timeout_ms += 1
+        if timeout_ms > _MAX_REACTOR_TIMEOUT_MS:
+            return _MAX_REACTOR_TIMEOUT_MS
+        return timeout_ms
+
+    def expire_requested_close(mut self) -> Optional[String]:
+        """Atomically let an elapsed retained deadline stop the connection."""
+        self.control[].sync.lock()
+        var deadline_ns = _load_i64(self.requested_close_deadline_ns)
+        if (
+            deadline_ns == 0
+            or _load_u8(self.peer_close_received) != UInt8(0)
+            or self.is_stopping()
+            or monotonic_now_ns() < deadline_ns
+        ):
+            self.control[].sync.unlock()
+            return Optional[String]()
+        var message = (
+            "WebSocket close publication deadline expired" if _load_u8(
+                self.local_close_published
+            )
+            == UInt8(0) else "WebSocket close handshake deadline expired"
+        )
+        _store_u8(self.requested_close_timed_out, UInt8(1))
+        self.requested_close_wire.clear()
+        self.pending_wire.clear()
+        _store_i64(self.pending_command_id, 0)
+        self.control[]._stop_locked(message)
+        self.control[].sync.unlock()
+        self.control[]._wake_owner()
+        return Optional[String](message^)
+
+    def wait_for_requested_close(mut self) raises -> Bool:
+        """Wait for the retained close request's terminal handshake truth."""
+        self.control[].sync.lock()
+        while True:
+            if _load_u8(self.peer_close_received) != UInt8(0):
+                self.control[].sync.unlock()
+                return True
+            if _load_u8(self.requested_close_timed_out) != UInt8(0):
+                self.control[].sync.unlock()
+                return False
+            if self.is_stopping():
+                var message = self.control[].failure_message.copy()
+                self.control[].sync.unlock()
+                raise NetworkError(
+                    message if message != "" else "WebSocket close interrupted"
+                )
+            var deadline_ns = _load_i64(self.requested_close_deadline_ns)
+            if deadline_ns == 0:
+                self.control[].sync.unlock()
+                raise NetworkError("WebSocket close already started")
+            if monotonic_now_ns() >= deadline_ns:
+                self.control[].sync.unlock()
+                var expired = self.expire_requested_close()
+                if expired:
+                    return False
+                self.control[].sync.lock()
+                continue
+            _ = self.control[].sync.wait_until(deadline_ns)
 
     def note_peer_close(mut self) -> Bool:
         """Publish peer CLOSE and report whether an echo is still owed."""
@@ -529,27 +660,9 @@ struct _WsDuplexState(Movable):
         self.control[].sync.unlock()
         return echo
 
-    def wait_for_peer_close(mut self, deadline_ns: Int64) raises -> Bool:
-        """Wait until the peer CLOSE or the caller's absolute deadline wins."""
-        self.control[].sync.lock()
-        while True:
-            if _load_u8(self.peer_close_received) != UInt8(0):
-                self.control[].sync.unlock()
-                return True
-            if self.is_stopping():
-                var message = self.control[].failure_message.copy()
-                self.control[].sync.unlock()
-                raise NetworkError(
-                    message if message != "" else "WebSocket close interrupted"
-                )
-            if monotonic_now_ns() >= deadline_ns:
-                self.control[].sync.unlock()
-                return False
-            _ = self.control[].sync.wait_until(deadline_ns)
-
     def send(mut self, var wire: List[UInt8]) raises:
         """Queue one frame and wait for owner-loop publication."""
-        var published = self._send(wire^, 0, False)
+        var published = self._send(wire^, 0)
         if not published:
             abort("untimed WebSocket send reached a deadline")
 
@@ -562,71 +675,36 @@ struct _WsDuplexState(Movable):
                 "WebSocket send deadline must be a positive absolute "
                 "monotonic timestamp"
             )
-        return self._send(wire^, deadline_ns, False)
-
-    def close_until(
-        mut self, var wire: List[UInt8], deadline_ns: Int64
-    ) raises -> Bool:
-        """Fence sends, publish CLOSE in order, then await the peer CLOSE."""
-        if not self.begin_local_close():
-            raise NetworkError("WebSocket close already started")
-        var published = self._send(wire^, deadline_ns, True)
-        if not published:
-            self.stop("WebSocket close publication deadline expired")
-            return False
-        var acknowledged = self.wait_for_peer_close(deadline_ns)
-        if not acknowledged:
-            self.stop("WebSocket close handshake deadline expired")
-            return False
-        self.stop("WebSocket close handshake complete")
-        return True
+        return self._send(wire^, deadline_ns)
 
     def _send(
         mut self,
         var wire: List[UInt8],
         deadline_ns: Int64,
-        closing: Bool,
     ) raises -> Bool:
         self.control[].sync.lock()
-        if closing and _load_u8(self.peer_close_received) != UInt8(0):
-            self.control[].sync.unlock()
-            return True
         if self.is_stopping():
             var message = self.control[].failure_message.copy()
             self.control[].sync.unlock()
             raise NetworkError(
                 message if message != "" else "WebSocket duplex is stopped"
             )
+        if _load_u8(self.local_close_started) != UInt8(0):
+            self.control[].sync.unlock()
+            raise NetworkError("WebSocket close has started")
         if deadline_ns != 0 and monotonic_now_ns() >= deadline_ns:
             self.control[].sync.unlock()
             return False
-        if not closing and _load_u8(self.local_close_started) != UInt8(0):
-            self.control[].sync.unlock()
-            raise NetworkError("WebSocket close has started")
-        while (
+        if (
             _load_i64(self.pending_command_id) != 0
             or _load_i64(self.active_command_id) != 0
         ):
-            if not closing:
-                self.control[].sync.unlock()
-                raise NetworkError(
-                    "WsSender supports exactly one sending thread per"
-                    " connection"
-                )
-            if self.is_stopping():
-                var message = self.control[].failure_message.copy()
-                self.control[].sync.unlock()
-                raise NetworkError(
-                    message if message != "" else "WebSocket close interrupted"
-                )
-            if monotonic_now_ns() >= deadline_ns:
-                self.control[].sync.unlock()
-                return False
-            _ = self.control[].sync.wait_until(deadline_ns)
+            self.control[].sync.unlock()
+            raise NetworkError(
+                "WsSender supports exactly one sending thread per connection"
+            )
         self.next_command_id += 1
         var command_id = self.next_command_id
-        if closing:
-            _store_i64(self.local_close_command_id, command_id)
         self.pending_wire = wire^
         _store_i64(self.pending_command_id, command_id)
         self.control[].sync.unlock()
@@ -638,9 +716,6 @@ struct _WsDuplexState(Movable):
 
         self.control[].sync.lock()
         while True:
-            if closing and _load_u8(self.peer_close_received) != UInt8(0):
-                self.control[].sync.unlock()
-                return True
             var now_ns = monotonic_now_ns() if deadline_ns != 0 else Int64(0)
             var wake = _classify_send_wake(
                 self.load_completed_command_id(),
@@ -687,8 +762,6 @@ struct _WsDuplexState(Movable):
         if _load_i64(self.active_command_id) == command_id:
             _store_i64(self.active_command_id, 0)
             _store_i64(self.completed_command_id, command_id)
-            if _load_i64(self.local_close_command_id) == command_id:
-                _store_u8(self.local_close_published, UInt8(1))
             self.control[].sync.broadcast()
         self.control[].sync.unlock()
 
@@ -792,6 +865,22 @@ struct WsShutdown(Movable):
         """Interrupt the socket and wake a receiver blocked in its reactor."""
         self._control[].stop("WebSocket duplex shut down")
 
+    def request_close_within(
+        mut self,
+        timeout_ms: Int,
+        code: UInt16 = WsCloseCode.NORMAL,
+        reason: String = "",
+    ) raises:
+        """Request one bounded close without waiting on the stream owner.
+
+        The first request fences application sends and retains its close frame
+        and deadline. Later requests are no-ops. The receiver-owned I/O loop
+        publishes the frame and completes or expires the handshake.
+        """
+        if not self._shared:
+            raise Error("WebSocket close requires an established split")
+        self._shared.value()[].request_close_within(timeout_ms, code, reason)
+
     def close_within(
         mut self,
         timeout_ms: Int,
@@ -804,12 +893,8 @@ struct WsShutdown(Movable):
         in-flight publication, serializes CLOSE behind it, and then waits for
         the peer CLOSE. ``False`` means the deadline won and SHUT_RDWR fired.
         """
-        if not self._shared:
-            raise Error("WebSocket close requires an established split")
-        var deadline_ns = _send_deadline_ns(timeout_ms)
-        var frame = WsFrame.close(code, reason)
-        var wire = self._shared.value()[].encode_outbound(frame)
-        return self._shared.value()[].close_until(wire^, deadline_ns)
+        self.request_close_within(timeout_ms, code, reason)
+        return self._shared.value()[].wait_for_requested_close()
 
 
 struct WsPreadmissionRelease(Movable):
@@ -891,16 +976,21 @@ struct WsReceiver(Movable):
             self._out_wire = control_wire^
             self._control_pending = False
             self._out_offset = 0
-            self._out_command_id = -1
+            self._out_command_id = _OUTBOUND_CONTROL_ID
             return
-        if not include_application:
+        if include_application:
+            var pending = self._shared[].take_pending()
+            if pending:
+                var command = pending.take()
+                self._out_command_id = command.id
+                self._out_wire = command.take_wire()
+                self._out_offset = 0
+                return
+        var requested_close = self._shared[].take_requested_close()
+        if not requested_close:
             return
-        var pending = self._shared[].take_pending()
-        if not pending:
-            return
-        var command = pending.take()
-        self._out_command_id = command.id
-        self._out_wire = command.take_wire()
+        self._out_command_id = _OUTBOUND_REQUESTED_CLOSE_ID
+        self._out_wire = requested_close.take()
         self._out_offset = 0
 
     def _fail(mut self, message: String) raises:
@@ -912,6 +1002,11 @@ struct WsReceiver(Movable):
         self._shared[].close_from_owner()
 
     def _check_running(mut self) raises:
+        var expired = self._shared[].expire_requested_close()
+        if expired:
+            var message = expired.take()
+            self._shared[].close_from_owner()
+            raise NetworkError(message^)
         if self._shared[].is_stopping():
             self._shared[].close_from_owner()
             raise NetworkError("WebSocket duplex stopped")
@@ -967,6 +1062,8 @@ struct WsReceiver(Movable):
                 self._out_command_id = 0
                 if completed_id > 0:
                     self._shared[].complete(completed_id)
+                elif completed_id == _OUTBOUND_REQUESTED_CLOSE_ID:
+                    self._shared[].note_requested_close_published()
             return written
         if written == _SSL_IO_WANT_READ:
             self._write_retry_interest = INTEREST_READ
@@ -984,7 +1081,8 @@ struct WsReceiver(Movable):
             self._shared[].control[].reactor.modify(
                 self._shared[].control[].raw_fd, interest
             )
-            _ = self._shared[].control[].reactor.poll(-1, self._events)
+            var timeout_ms = self._shared[].requested_close_poll_timeout_ms()
+            _ = self._shared[].control[].reactor.poll(timeout_ms, self._events)
         except error:
             self._fail(String(error))
 

@@ -28,7 +28,7 @@ from flare.ws import (
     WsServer,
     WsConnection,
 )
-from flare.ws.frame import _encode_client_frame
+from flare.ws.frame import _classify_close_payload, _encode_client_frame
 from flare.ws._transport import _WsStream
 from flare.tcp import TcpStream, TcpListener
 from flare.net import SocketAddr
@@ -90,6 +90,47 @@ def test_close_frame_with_reason() raises:
     assert_equal(chr(Int(frame.payload[2])), "b")
     assert_equal(chr(Int(frame.payload[3])), "y")
     assert_equal(chr(Int(frame.payload[4])), "e")
+
+
+def test_close_payload_classifier_enforces_wire_grammar() raises:
+    """One classifier must distinguish protocol and UTF-8 violations."""
+    assert_true(_classify_close_payload([]) is None)
+    assert_true(
+        _classify_close_payload(WsFrame.close(1000, "normal").payload) is None
+    )
+    assert_true(
+        _classify_close_payload(WsFrame.close(3000, "registered").payload)
+        is None
+    )
+    assert_true(
+        _classify_close_payload(WsFrame.close(4999, "private").payload) is None
+    )
+
+    var one_byte = _classify_close_payload([UInt8(0x03)]).value().copy()
+    assert_equal(one_byte.code, WsCloseCode.PROTOCOL_ERROR)
+    assert_equal(one_byte.reason, "invalid_close_payload")
+
+    var reserved = (
+        _classify_close_payload([UInt8(0x03), UInt8(0xED)]).value().copy()
+    )
+    assert_equal(reserved.code, WsCloseCode.PROTOCOL_ERROR)
+    assert_equal(reserved.reason, "invalid_close_code")
+
+    var unassigned = (
+        _classify_close_payload([UInt8(0x0B), UInt8(0xB7)]).value().copy()
+    )
+    assert_equal(unassigned.code, WsCloseCode.PROTOCOL_ERROR)
+    assert_equal(unassigned.reason, "invalid_close_code")
+
+    var invalid_reason = (
+        _classify_close_payload(
+            [UInt8(0x03), UInt8(0xE8), UInt8(0xC3), UInt8(0x28)]
+        )
+        .value()
+        .copy()
+    )
+    assert_equal(invalid_reason.code, WsCloseCode.INVALID_PAYLOAD)
+    assert_equal(invalid_reason.reason, "invalid_close_reason")
 
 
 def test_is_control_data_frames() raises:
@@ -245,6 +286,18 @@ def test_decode_small_text_frame() raises:
     assert_true(result.frame.fin)
     assert_equal(result.consumed, 7)
     assert_equal(result.frame.text_payload(), "hello")
+
+
+def test_unicode_text_round_trips_byte_exactly() raises:
+    """Validated UTF-8 must survive frame encode and decode unchanged."""
+    var expected = "Grüße, 世界 👋"
+    var wire = WsFrame.text(expected).encode()
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    var actual = result.frame.text_payload()
+    assert_equal(actual, expected)
+    assert_equal(actual.byte_length(), expected.byte_length())
+    for index in range(expected.byte_length()):
+        assert_equal(actual.as_bytes()[index], expected.as_bytes()[index])
 
 
 def test_decode_empty_ping() raises:

@@ -57,6 +57,7 @@ from flare.net._libc import _recv, _send, MSG_NOSIGNAL
 from flare.runtime import Pool
 from flare.tcp import TcpStream
 from flare.tls._server_ffi import SSL_IO_WANT_READ, SSL_IO_WANT_WRITE
+from flare.ws.frame import WsFrame
 from flare.ws.server_h2 import WsH2Hooks, WsOverH2ServerStream
 
 from ._reactor.tls_transport import TlsTransport
@@ -607,10 +608,18 @@ struct Http2ConnHandle(Movable):
             var sid = sids[i]
             var carrier = self._ws_tunnels[sid].copy()
             while True:
-                var f = carrier.try_pull_frame(self.h2)
-                if not f:
+                var frame: Optional[WsFrame]
+                try:
+                    frame = carrier.try_pull_frame(self.h2)
+                except:
+                    # A closed carrier already queued its stream-local
+                    # protocol CLOSE; keep the h2 connection alive to drain it.
+                    if carrier.is_closed():
+                        break
+                    raise
+                if not frame:
                     break
-                hooks.msg_thunk(hooks.addr, carrier, self.h2, f.take())
+                hooks.msg_thunk(hooks.addr, carrier, self.h2, frame.take())
                 if carrier.is_closed():
                     break
             if carrier.is_closed() or not self.h2.stream_is_open(sid):

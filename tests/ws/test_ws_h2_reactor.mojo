@@ -2,9 +2,10 @@
 
 Forks a real ``HttpServer.serve(handler, ws_handler)`` (h2c prior-knowledge,
 no TLS) and hand-drives an ``Http2ClientConnection`` over a socket: opens an
-Extended CONNECT tunnel, sends a masked client TEXT frame, and asserts the
-edge-driven ``WsH2Handler.on_message`` echo rides back unmasked. Proves the
-reactor accept/pump/teardown wiring, not just the sans-I/O bridge.
+Extended CONNECT tunnel, sends masked client frames, and asserts the
+edge-driven ``WsH2Handler.on_message`` echo and malformed-CLOSE rejection ride
+back unmasked. Proves the reactor accept/pump/teardown wiring, not just the
+sans-I/O bridge.
 """
 
 from std.testing import assert_equal, assert_true
@@ -19,7 +20,7 @@ from flare.net import SocketAddr
 from flare.tcp import TcpStream
 from flare.utils import SIGKILL, exit, fork, kill, usleep, waitpid
 from flare.ws.client_h2 import WsOverH2Stream, bootstrap_ws_over_h2
-from flare.ws.frame import WsFrame, WsOpcode
+from flare.ws.frame import WsCloseCode, WsFrame, WsOpcode
 from flare.ws.server_h2 import WsH2Handler, WsOverH2ServerStream
 
 
@@ -95,6 +96,17 @@ def _pull(mut client: Http2ClientConnection, mut s: TcpStream) raises -> Bool:
         return False  # recv timeout -- nothing more this round
 
 
+def _close_code(frame: WsFrame) -> UInt16:
+    """Read the status code from a validated CLOSE frame."""
+    return (UInt16(frame.payload[0]) << 8) | UInt16(frame.payload[1])
+
+
+def _close_reason(frame: WsFrame) -> String:
+    """Read the reason from a validated CLOSE frame."""
+    var reason = Span[UInt8, _](frame.payload)[2:]
+    return String(unsafe_from_utf8=reason)
+
+
 def main() raises:
     print("test_ws_h2_reactor")
     var srv = HttpServer.bind(SocketAddr.localhost(0))
@@ -144,10 +156,31 @@ def main() raises:
         if got:
             break
 
-    _ = kill(pid, SIGKILL)
-    waitpid(pid)
-
     assert_true(Bool(got), "client must decode the server echo reply")
     assert_equal(got.value().opcode, WsOpcode.TEXT)
     assert_equal(got.value().text_payload(), "echo:ping")
-    print("test_ws_h2_reactor: 1 passed")
+
+    client_ws.send_frame(
+        client,
+        WsFrame(opcode=WsOpcode.CLOSE, payload=[UInt8(0x03)]),
+    )
+    var close_response = Optional[WsFrame]()
+    for _i in range(32):
+        _flush(client, client_stream)
+        _ = _pull(client, client_stream)
+        close_response = client_ws.try_pull_frame(client)
+        if close_response:
+            break
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+
+    assert_true(
+        Bool(close_response),
+        "client must receive the server's malformed-CLOSE rejection",
+    )
+    var close = close_response.take()
+    assert_equal(close.opcode, WsOpcode.CLOSE)
+    assert_equal(_close_code(close), WsCloseCode.PROTOCOL_ERROR)
+    assert_equal(_close_reason(close), "invalid_close_payload")
+    print("test_ws_h2_reactor: 2 passed")

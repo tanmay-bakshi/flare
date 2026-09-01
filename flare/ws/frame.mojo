@@ -589,12 +589,9 @@ struct WsFrame(Movable, Writable):
         Raises:
             WsProtocolError: If the payload contains invalid UTF-8.
         """
-        if not _is_valid_utf8(self.payload):
+        if not _is_valid_utf8(Span[UInt8, _](self.payload)):
             raise WsProtocolError("TEXT frame payload is not valid UTF-8")
-        var s = String(capacity=len(self.payload) + 1)
-        for b in self.payload:
-            s += chr(Int(b))
-        return s^
+        return String(unsafe_from_utf8=Span[UInt8, _](self.payload))
 
     def write_to[W: Writer](self, mut writer: W):
         writer.write(
@@ -611,7 +608,7 @@ struct WsFrame(Movable, Writable):
 # ── UTF-8 validation ──────────────────────────────────────────────────────────
 
 
-def _is_valid_utf8(data: List[UInt8]) -> Bool:
+def _is_valid_utf8(data: Span[UInt8, _]) -> Bool:
     """Validate that ``data`` is well-formed UTF-8.
 
     Checks byte sequences per RFC 3629: 1-byte (ASCII), 2-byte, 3-byte, and
@@ -665,6 +662,63 @@ def _is_valid_utf8(data: List[UInt8]) -> Bool:
         else:
             return False
     return True
+
+
+@fieldwise_init
+struct _ClosePayloadRejection(Copyable, Movable):
+    """One truthful response to malformed peer CLOSE payload bytes."""
+
+    var code: UInt16
+    var reason: String
+
+
+def _is_legal_close_code(code: UInt16) -> Bool:
+    """Return whether ``code`` may appear on the wire.
+
+    RFC 6455 protocol codes are the assigned 1000-series values below.
+    Registered application codes occupy 3000–3999 and private codes occupy
+    4000–4999. Reserved and unassigned protocol/extension values are not
+    lawful peer status codes.
+    """
+    return (
+        (code >= 1000 and code <= 1003)
+        or (code >= 1007 and code <= 1014)
+        or (code >= 3000 and code <= 4999)
+    )
+
+
+def _classify_close_payload(
+    payload: List[UInt8],
+) -> Optional[_ClosePayloadRejection]:
+    """Classify one unmasked CLOSE payload before echo or delivery."""
+    if len(payload) == 0:
+        return Optional[_ClosePayloadRejection]()
+    if len(payload) == 1:
+        return Optional[_ClosePayloadRejection](
+            _ClosePayloadRejection(
+                WsCloseCode.PROTOCOL_ERROR,
+                "invalid_close_payload",
+            )
+        )
+
+    var code = (UInt16(payload[0]) << 8) | UInt16(payload[1])
+    if not _is_legal_close_code(code):
+        return Optional[_ClosePayloadRejection](
+            _ClosePayloadRejection(
+                WsCloseCode.PROTOCOL_ERROR,
+                "invalid_close_code",
+            )
+        )
+
+    var bytes = Span[UInt8, _](payload)
+    if not _is_valid_utf8(bytes[2:]):
+        return Optional[_ClosePayloadRejection](
+            _ClosePayloadRejection(
+                WsCloseCode.INVALID_PAYLOAD,
+                "invalid_close_reason",
+            )
+        )
+    return Optional[_ClosePayloadRejection]()
 
 
 # ── SIMD masking helper ───────────────────────────────────────────────────────

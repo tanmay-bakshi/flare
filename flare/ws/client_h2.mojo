@@ -39,6 +39,7 @@ from .frame import (
     WsCloseCode,
     WsProtocolError,
     _DecodeResult,
+    _classify_close_payload,
     _encode_client_frame,
 )
 from ..http2.client import Http2ClientConnection
@@ -221,6 +222,14 @@ struct WsOverH2Stream(Movable):
         var consumed = dr.consumed
         var got = dr^.take_frame()
         if got.opcode == WsOpcode.CLOSE:
+            var rejection = _classify_close_payload(got.payload)
+            if rejection is not None:
+                var rejected = rejection.value().copy()
+                self.send_frame(
+                    conn,
+                    WsFrame.close(rejected.code, rejected.reason),
+                )
+                raise WsProtocolError(rejected.reason)
             self.closed = True
         # Compact: drop the consumed prefix.
         var rest = List[UInt8]()

@@ -16,6 +16,7 @@ from .frame import (
     WsOpcode,
     WsProtocolError,
     _WsFrameHeader,
+    _classify_close_payload,
     _encode_client_frame,
     _inspect_frame_header,
 )
@@ -1323,6 +1324,10 @@ struct WsReceiver(Movable):
                 self._flush_control()
                 continue
             if frame.opcode == WsOpcode.CLOSE:
+                var rejection = _classify_close_payload(frame.payload)
+                if rejection is not None:
+                    var rejected = rejection.value().copy()
+                    self._reject(rejected.code, rejected.reason)
                 var echo = self._shared[].note_peer_close()
                 if echo:
                     var response = WsFrame(

@@ -45,6 +45,7 @@ from .frame import (
     WsOpcode,
     WsProtocolError,
     _WsFrameHeader,
+    _classify_close_payload,
     _encode_client_frame,
     _inspect_frame_header,
 )
@@ -1187,6 +1188,11 @@ struct WsClient(Movable):
                 var wire = _encode_client_frame(pong)
                 self._stream.write_all(Span[UInt8, _](wire))
                 continue
+            if frame.opcode == WsOpcode.CLOSE:
+                var rejection = _classify_close_payload(frame.payload)
+                if rejection is not None:
+                    var rejected = rejection.value().copy()
+                    self._reject_inbound(rejected.code, rejected.reason)
             return frame^
 
     def _reject_inbound(mut self, code: UInt16, message: String) raises:

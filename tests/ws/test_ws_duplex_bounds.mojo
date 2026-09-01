@@ -130,6 +130,32 @@ def _expect_invalid_utf8(
     assert_equal(_close_reason(close), "invalid_utf8")
 
 
+def _close_wire(payload: List[UInt8], masked: Bool) raises -> List[UInt8]:
+    var frame = WsFrame(opcode=WsOpcode.CLOSE, payload=payload)
+    return _encode_client_frame(frame) if masked else frame.encode(mask=False)
+
+
+def _expect_close_rejection(
+    var receiver: WsReceiver,
+    var peer: TcpStream,
+    masked_close: Bool,
+    expected_code: UInt16,
+    expected_reason: String,
+) raises:
+    var message = String("")
+    try:
+        _ = receiver.recv()
+    except error:
+        message = String(error)
+    peer.set_recv_timeout(1_000)
+    var close = _read_frame(peer)
+    assert_true(expected_reason in message, message)
+    assert_equal(close.opcode, WsOpcode.CLOSE)
+    assert_equal(close.masked, masked_close)
+    assert_equal(_close_code(close), expected_code)
+    assert_equal(_close_reason(close), expected_reason)
+
+
 def _invalid_text_fragments(masked: Bool) raises -> List[UInt8]:
     var first = WsFrame(
         opcode=WsOpcode.TEXT,
@@ -149,6 +175,60 @@ def _invalid_text_fragments(masked: Bool) raises -> List[UInt8]:
     for byte in tail:
         wire.append(byte)
     return wire^
+
+
+def _split_codepoint_fragments(masked: Bool) raises -> List[UInt8]:
+    var first = WsFrame(
+        opcode=WsOpcode.TEXT,
+        payload=[UInt8(0xC3)],
+        fin=False,
+    )
+    var continuation = WsFrame(
+        opcode=WsOpcode.CONTINUATION,
+        payload=[UInt8(0xA9), UInt8(0x21)],
+    )
+    var wire = _encode_client_frame(first) if masked else first.encode(
+        mask=False
+    )
+    var tail = _encode_client_frame(
+        continuation
+    ) if masked else continuation.encode(mask=False)
+    for byte in tail:
+        wire.append(byte)
+    return wire^
+
+
+def test_split_client_preserves_codepoint_across_fragments() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var local = TcpStream.connect(listener.local_addr())
+    var peer = listener.accept()
+    var duplex = _split_stream(
+        _WsStream(local^),
+        _CAP,
+        mask_outbound=True,
+        expect_masked_inbound=False,
+    )
+    var receiver = duplex.take_receiver()
+    _ = duplex.take_sender()
+    _ = duplex.take_shutdown()
+
+    var wire = _split_codepoint_fragments(masked=False)
+    peer.write_all(Span[UInt8, _](wire))
+    assert_equal(receiver.recv_message().as_text(), "é!")
+
+
+def test_split_server_preserves_codepoint_across_fragments() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var peer = TcpStream.connect(listener.local_addr())
+    var local = listener.accept()
+    var duplex = _split_server(local^, _CAP)
+    var receiver = duplex.take_receiver()
+    _ = duplex.take_sender()
+    _ = duplex.take_shutdown()
+
+    var wire = _split_codepoint_fragments(masked=True)
+    peer.write_all(Span[UInt8, _](wire))
+    assert_equal(receiver.recv_message().as_text(), "é!")
 
 
 def test_split_client_rejects_aggregate_invalid_utf8() raises:
@@ -207,6 +287,128 @@ def test_unsplit_client_rejects_aggregate_invalid_utf8() raises:
     assert_true(close.masked)
     assert_equal(_close_code(close), WsCloseCode.INVALID_PAYLOAD)
     assert_equal(_close_reason(close), "invalid_utf8")
+
+
+def test_split_server_rejects_one_byte_close_before_echo() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var peer = TcpStream.connect(listener.local_addr())
+    var local = listener.accept()
+    var duplex = _split_server(local^, _CAP)
+    var receiver = duplex.take_receiver()
+    _ = duplex.take_sender()
+    _ = duplex.take_shutdown()
+
+    var wire = _close_wire([UInt8(0x03)], masked=True)
+    peer.write_all(Span[UInt8, _](wire))
+    _expect_close_rejection(
+        receiver^,
+        peer^,
+        masked_close=False,
+        expected_code=WsCloseCode.PROTOCOL_ERROR,
+        expected_reason="invalid_close_payload",
+    )
+
+
+def test_split_client_rejects_reserved_close_before_echo() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var local = TcpStream.connect(listener.local_addr())
+    var peer = listener.accept()
+    var duplex = _split_stream(
+        _WsStream(local^),
+        _CAP,
+        mask_outbound=True,
+        expect_masked_inbound=False,
+    )
+    var receiver = duplex.take_receiver()
+    _ = duplex.take_sender()
+    _ = duplex.take_shutdown()
+
+    var wire = _close_wire([UInt8(0x03), UInt8(0xED)], masked=False)
+    peer.write_all(Span[UInt8, _](wire))
+    _expect_close_rejection(
+        receiver^,
+        peer^,
+        masked_close=True,
+        expected_code=WsCloseCode.PROTOCOL_ERROR,
+        expected_reason="invalid_close_code",
+    )
+
+
+def test_unsplit_client_rejects_invalid_close_reason() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var local = TcpStream.connect(listener.local_addr())
+    var peer = listener.accept()
+    var control = ArcPointer[_WsControl](_WsControl())
+    var stream = _WsStream(local^)
+    assert_true(control[].attach_fd(stream.fd()))
+    var client = WsClient(stream^, "test-key", control)
+
+    var wire = _close_wire(
+        [UInt8(0x03), UInt8(0xE8), UInt8(0xC3), UInt8(0x28)],
+        masked=False,
+    )
+    peer.write_all(Span[UInt8, _](wire))
+    var message = String("")
+    try:
+        _ = client.recv(_CAP)
+    except error:
+        message = String(error)
+    peer.set_recv_timeout(1_000)
+    var close = _read_frame(peer)
+    assert_true("invalid_close_reason" in message, message)
+    assert_true(close.masked)
+    assert_equal(_close_code(close), WsCloseCode.INVALID_PAYLOAD)
+    assert_equal(_close_reason(close), "invalid_close_reason")
+
+
+def test_unsplit_server_rejects_invalid_close_reason() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var peer = TcpStream.connect(listener.local_addr())
+    var local = listener.accept()
+    var address = local.peer_addr()
+    var request = WsUpgradeRequest("GET", "/", "key", [], [])
+    var connection = WsConnection(local^, address, request^)
+
+    var wire = _close_wire(
+        [UInt8(0x03), UInt8(0xE8), UInt8(0xC3), UInt8(0x28)],
+        masked=True,
+    )
+    peer.write_all(Span[UInt8, _](wire))
+    var message = String("")
+    try:
+        _ = connection.recv(_CAP)
+    except error:
+        message = String(error)
+    peer.set_recv_timeout(1_000)
+    var close = _read_frame(peer)
+    assert_true("invalid_close_reason" in message, message)
+    assert_false(close.masked)
+    assert_equal(_close_code(close), WsCloseCode.INVALID_PAYLOAD)
+    assert_equal(_close_reason(close), "invalid_close_reason")
+
+
+def test_split_server_echoes_valid_close_payload_unchanged() raises:
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var peer = TcpStream.connect(listener.local_addr())
+    var local = listener.accept()
+    var duplex = _split_server(local^, _CAP)
+    var receiver = duplex.take_receiver()
+    _ = duplex.take_sender()
+    _ = duplex.take_shutdown()
+
+    var expected = WsFrame.close(WsCloseCode.GOING_AWAY, "adiós")
+    var wire = _close_wire(expected.payload.copy(), masked=True)
+    peer.write_all(Span[UInt8, _](wire))
+
+    var received = receiver.recv()
+    peer.set_recv_timeout(1_000)
+    var echoed = _read_frame(peer)
+    assert_equal(received.opcode, WsOpcode.CLOSE)
+    assert_equal(echoed.opcode, WsOpcode.CLOSE)
+    assert_false(echoed.masked)
+    assert_equal(len(echoed.payload), len(expected.payload))
+    for index in range(len(expected.payload)):
+        assert_equal(echoed.payload[index], expected.payload[index])
 
 
 def test_client_rejects_declared_oversize_before_payload() raises:
@@ -577,9 +779,16 @@ def test_receiver_thread_can_request_close_without_deadlock() raises:
 
 
 def main() raises:
+    test_split_client_preserves_codepoint_across_fragments()
+    test_split_server_preserves_codepoint_across_fragments()
     test_split_client_rejects_aggregate_invalid_utf8()
     test_split_server_rejects_aggregate_invalid_utf8()
     test_unsplit_client_rejects_aggregate_invalid_utf8()
+    test_split_server_rejects_one_byte_close_before_echo()
+    test_split_client_rejects_reserved_close_before_echo()
+    test_unsplit_client_rejects_invalid_close_reason()
+    test_unsplit_server_rejects_invalid_close_reason()
+    test_split_server_echoes_valid_close_payload_unchanged()
     test_client_rejects_declared_oversize_before_payload()
     test_server_rejects_declared_oversize_before_payload()
     test_client_counts_fragmented_message_total()

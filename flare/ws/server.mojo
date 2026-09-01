@@ -38,6 +38,7 @@ from .frame import (
     WsCloseCode,
     WsProtocolError,
     _WsFrameHeader,
+    _classify_close_payload,
     _inspect_frame_header,
 )
 from ..crypto.base64 import base64_encode as _b64_encode_srv
@@ -614,6 +615,11 @@ struct WsConnection(Movable):
                 var wire = pong.encode(mask=False)
                 self._stream.write_all(Span[UInt8, _](wire))
                 continue
+            if frame.opcode == WsOpcode.CLOSE:
+                var rejection = _classify_close_payload(frame.payload)
+                if rejection is not None:
+                    var rejected = rejection.value().copy()
+                    self._reject_inbound(rejected.code, rejected.reason)
             return frame^
 
     def _reject_inbound(mut self, code: UInt16, message: String) raises:

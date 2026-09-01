@@ -13,7 +13,14 @@ the connection; the caller feeds/drains the underlying
 :class:`Http2Connection` (reactor or paired-driver test).
 """
 
-from .frame import WsCloseCode, WsFrame, WsOpcode, _DecodeResult
+from .frame import (
+    WsCloseCode,
+    WsFrame,
+    WsOpcode,
+    WsProtocolError,
+    _DecodeResult,
+    _classify_close_payload,
+)
 from ..http2.server import Http2Connection
 from ..runtime.pool import Pool
 
@@ -71,6 +78,14 @@ struct WsOverH2ServerStream(Copyable, Movable):
         var consumed = dr.consumed
         var got = dr^.take_frame()
         if got.opcode == WsOpcode.CLOSE:
+            var rejection = _classify_close_payload(got.payload)
+            if rejection is not None:
+                var rejected = rejection.value().copy()
+                self.send_frame(
+                    conn,
+                    WsFrame.close(rejected.code, rejected.reason),
+                )
+                raise WsProtocolError(rejected.reason)
             self.closed = True
         var rest = List[UInt8]()
         for i in range(consumed, len(self.read_buffer)):

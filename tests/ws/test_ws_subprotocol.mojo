@@ -78,7 +78,7 @@ def test_client_and_server_expose_selected_subprotocol() raises:
         var selected = client.negotiated_subprotocol()
         assert_true(selected)
         assert_equal(selected.value(), "chat.v2")
-        assert_equal(client.recv().text_payload(), "chat.v2")
+        assert_equal(client.recv(8 * 1024 * 1024).text_payload(), "chat.v2")
     except error:
         failure = String(error)
     _stop_server(pid)
@@ -99,7 +99,7 @@ def test_client_accepts_server_without_selection() raises:
             subprotocols=["chat.v1"],
         )
         assert_false(client.negotiated_subprotocol())
-        assert_equal(client.recv().text_payload(), "")
+        assert_equal(client.recv(8 * 1024 * 1024).text_payload(), "")
     except error:
         failure = String(error)
     _stop_server(pid)

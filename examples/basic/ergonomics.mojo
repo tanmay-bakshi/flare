@@ -216,7 +216,7 @@ def _demo_ws_high_level():
             # recv_message() wraps recv() in a typed WsMessage
             var found = False
             for _ in range(5):
-                var msg = ws.recv_message()
+                var msg = ws.recv_message(max_message_bytes=65_536)
                 if msg.is_text and "hello from flare!" in msg.as_text():
                     print(" ✓ WsMessage echo:", msg.as_text())
                     found = True

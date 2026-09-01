@@ -103,6 +103,101 @@ struct _DecodeResult(Movable):
         return self.frame^
 
 
+@fieldwise_init
+struct _WsFrameHeader(Copyable, Movable):
+    """Allocation-free frame metadata parsed from a complete header."""
+
+    var fin: Bool
+    var opcode: UInt8
+    var masked: Bool
+    var payload_length: Int
+    var header_length: Int
+
+
+def _inspect_frame_header(
+    data: Span[UInt8, _],
+) raises -> Optional[_WsFrameHeader]:
+    """Inspect one frame header without allocating its declared payload."""
+    var size = len(data)
+    if size < 2:
+        return Optional[_WsFrameHeader]()
+
+    var first = data[0]
+    var second = data[1]
+    var fin = (first & 0x80) != 0
+    var rsv1 = (first & 0x40) != 0
+    var rsv2 = (first & 0x20) != 0
+    var rsv3 = (first & 0x10) != 0
+    var opcode = first & 0x0F
+    var masked = (second & 0x80) != 0
+    var length7 = Int(second & 0x7F)
+
+    if rsv1 or rsv2 or rsv3:
+        raise WsProtocolError(
+            "reserved bits must be zero without a negotiated extension"
+        )
+
+    var cursor = 2
+    var payload_length: Int
+    if length7 < 126:
+        payload_length = length7
+    elif length7 == 126:
+        if size < cursor + 2:
+            return Optional[_WsFrameHeader]()
+        payload_length = (Int(data[cursor]) << 8) | Int(data[cursor + 1])
+        cursor += 2
+    else:
+        if size < cursor + 8:
+            return Optional[_WsFrameHeader]()
+        if (data[cursor] & 0x80) != 0:
+            raise WsProtocolError(
+                "64-bit frame length MSB must be zero (RFC 6455 §5.2)"
+            )
+        if (
+            Int(data[cursor])
+            | Int(data[cursor + 1])
+            | Int(data[cursor + 2])
+            | Int(data[cursor + 3])
+        ) != 0:
+            raise WsProtocolError(
+                "64-bit payload length exceeds 32-bit range; not supported"
+            )
+        payload_length = (
+            (Int(data[cursor + 4]) << 24)
+            | (Int(data[cursor + 5]) << 16)
+            | (Int(data[cursor + 6]) << 8)
+            | Int(data[cursor + 7])
+        )
+        cursor += 8
+
+    if masked:
+        cursor += 4
+        if size < cursor:
+            return Optional[_WsFrameHeader]()
+
+    if (opcode & 0x8) != 0:
+        if not fin:
+            raise WsProtocolError("control frames must not be fragmented")
+        if payload_length > 125:
+            raise WsProtocolError("control frame payload exceeds 125 bytes")
+
+    return Optional[_WsFrameHeader](
+        _WsFrameHeader(fin, opcode, masked, payload_length, cursor)
+    )
+
+
+def _truncate_close_reason(reason: String) -> String:
+    """Return the longest UTF-8 codepoint prefix no longer than 123 bytes."""
+    if reason.byte_length() <= 123:
+        return reason
+    var truncated = String(capacity=123)
+    for codepoint in reason.codepoint_slices():
+        if truncated.byte_length() + codepoint.byte_length() > 123:
+            break
+        truncated += String(codepoint)
+    return truncated^
+
+
 struct WsFrame(Movable, Writable):
     """A single WebSocket frame.
 
@@ -210,10 +305,11 @@ struct WsFrame(Movable, Writable):
         Returns:
             A ``WsFrame`` with opcode ``CLOSE``.
         """
-        var payload = List[UInt8](capacity=2 + reason.byte_length())
+        var safe_reason = _truncate_close_reason(reason)
+        var payload = List[UInt8](capacity=2 + safe_reason.byte_length())
         payload.append(UInt8(code >> 8))
         payload.append(UInt8(code & 0xFF))
-        for b in reason.as_bytes():
+        for b in safe_reason.as_bytes():
             payload.append(b)
         return WsFrame(opcode=WsOpcode.CLOSE, payload=payload^)
 

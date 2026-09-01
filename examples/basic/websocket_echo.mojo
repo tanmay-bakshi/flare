@@ -91,7 +91,7 @@ def main() raises:
         # The server may send a welcome banner; read until we get our echo.
         var found = False
         for _ in range(5):
-            var frame = ws.recv()
+            var frame = ws.recv(8 * 1024 * 1024)
             _show_frame(frame)
             if "flare says hello!" in frame.text_payload():
                 found = True

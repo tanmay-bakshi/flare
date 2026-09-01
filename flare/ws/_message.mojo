@@ -4,7 +4,7 @@
 struct WsMessage(Movable):
     """A high-level WebSocket text or binary message.
 
-    Produced by ``WsClient.recv_message()`` and
+    Produced by ``WsClient.recv_message(max_message_bytes)`` and
     ``WsReceiver.recv_message()``. Use ``is_text`` to discriminate between
     message kinds.
     """

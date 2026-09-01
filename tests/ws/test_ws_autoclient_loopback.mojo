@@ -64,7 +64,7 @@ from flare.net import SocketAddr
 def _echo_handler(mut conn: WsConnection) raises:
     """Tiny echo handler: receive one frame, send the matching
     type back, then return so the connection drops cleanly."""
-    var frame = conn.recv()
+    var frame = conn.recv(8 * 1024 * 1024)
     if frame.opcode == WsOpcode.TEXT:
         conn.send_text(frame.text_payload())
     elif frame.opcode == WsOpcode.BINARY:
@@ -115,7 +115,7 @@ def test_ws_autoclient_loopback_default_prefer_h2() raises:
     assert_true(auto.is_h1_path())
     var ws = auto.take_h1_client()
     ws.send_text("hello")
-    var msg = ws.recv()
+    var msg = ws.recv(8 * 1024 * 1024)
     assert_equal(msg.opcode, WsOpcode.TEXT)
     assert_equal(msg.text_payload(), "hello")
 
@@ -137,7 +137,7 @@ def test_ws_autoclient_loopback_prefer_h2_false() raises:
     assert_equal(auto.chosen_wire, WsWireChoice.HTTP_1_1)
     var ws = auto.take_h1_client()
     ws.send_text("again")
-    var msg = ws.recv()
+    var msg = ws.recv(8 * 1024 * 1024)
     assert_equal(msg.opcode, WsOpcode.TEXT)
     assert_equal(msg.text_payload(), "again")
 
@@ -165,7 +165,7 @@ def test_ws_autoclient_loopback_binary_round_trip() raises:
     payload.append(UInt8(0xBE))
     payload.append(UInt8(0xEF))
     ws.send_binary(payload)
-    var msg = ws.recv()
+    var msg = ws.recv(8 * 1024 * 1024)
     assert_equal(msg.opcode, WsOpcode.BINARY)
     assert_equal(len(msg.payload), 4)
     assert_equal(msg.payload[0], UInt8(0xDE))
@@ -197,7 +197,7 @@ def test_ws_autoclient_negotiates_configured_subprotocol() raises:
         assert_true(carrier_selected)
         assert_equal(carrier_selected.value(), "chat.v2")
         ws.send_text("protocol")
-        assert_equal(ws.recv().text_payload(), "protocol")
+        assert_equal(ws.recv(8 * 1024 * 1024).text_payload(), "protocol")
     except error:
         failure = String(error)
     _kill(pid)

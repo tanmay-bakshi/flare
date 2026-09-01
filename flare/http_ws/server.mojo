@@ -19,7 +19,7 @@ from flare.runtime._thread import ThreadHandle, _OpaquePtr
 from flare.runtime.event import Event, INTEREST_READ
 from flare.runtime.reactor import Reactor
 from flare.tcp import TcpListener, TcpStream
-from flare.ws._duplex import _DuplexSync
+from flare.ws._duplex import _DuplexSync, WsPreadmissionRelease
 from flare.ws.server import (
     WsConnection,
     WsUpgradeRequest,
@@ -277,13 +277,17 @@ struct _HttpWsServerState(Movable):
         var owns = _load_i64_pointer(
             self.preadmission_fds.unsafe_offset(slot)
         ) == Int64(fd)
-        if owns:
-            _store_i64_pointer(
-                self.preadmission_fds.unsafe_offset(slot), Int64(INVALID_FD)
-            )
         var admitted = owns and not self.is_stopping()
         self.sync.unlock()
         return admitted
+
+    def release_preadmission(mut self, slot: Int, fd: c_int):
+        """Idempotently release one still-matching fd under the stop mutex."""
+        self.sync.lock()
+        var cell = self.preadmission_fds.unsafe_offset(slot)
+        if _load_i64_pointer(cell) == Int64(fd):
+            _store_i64_pointer(cell, Int64(INVALID_FD))
+        self.sync.unlock()
 
     def complete(mut self, slot: Int):
         self.sync.lock()
@@ -340,6 +344,30 @@ struct _HttpWsServerState(Movable):
         self.sync.unlock()
         if message.byte_length() > 0:
             raise Error("HTTP/WS server worker failed: " + message)
+
+
+@fieldwise_init
+struct _PreadmissionReleaseContext(Movable):
+    var state: ArcPointer[_HttpWsServerState]
+    var slot: Int
+    var fd: c_int
+
+
+def _release_preadmission_context(address: Int):
+    var pointer = UnsafePointer[
+        _PreadmissionReleaseContext, MutUntrackedOrigin
+    ](unsafe_from_address=address)
+    var context = pointer.unsafe_take_pointee()
+    pointer.unsafe_free()
+    context.state[].release_preadmission(context.slot, context.fd)
+
+
+def _preadmission_release(
+    state: ArcPointer[_HttpWsServerState], slot: Int, fd: c_int
+) -> WsPreadmissionRelease:
+    var pointer = unsafe_alloc[_PreadmissionReleaseContext](1)
+    pointer.unsafe_write(_PreadmissionReleaseContext(state, slot, fd))
+    return WsPreadmissionRelease(Int(pointer), _release_preadmission_context)
 
 
 struct _ConnectionContext[H: Handler & Copyable](Movable):
@@ -412,9 +440,9 @@ def _serve_connection[
             )
         return
 
-    var path = _path_only(request.url)
-    var ws_index = context.routes._ws_index(path)
     var is_upgrade = _is_websocket_upgrade(request)
+    var ws_index = context.routes._ws_index(request.url)
+    var http_ws_index = context.routes._ws_index(_path_only(request.url))
 
     if is_upgrade and ws_index >= 0:
         var ws_request: WsUpgradeRequest
@@ -442,8 +470,11 @@ def _serve_connection[
                 request.peer,
                 ws_request^,
                 subprotocol^,
+                Optional[WsPreadmissionRelease](
+                    _preadmission_release(context.state, context.slot, fd)
+                ),
             )
-            context.routes._serve_ws(ws_index, connection)
+            context.routes._serve_ws(ws_index, connection^)
         except:
             pass
         return
@@ -453,7 +484,7 @@ def _serve_connection[
     if is_upgrade:
         _send_status(context.stream.value(), Status.BAD_REQUEST, "Bad Request")
         return
-    if not is_upgrade and ws_index >= 0:
+    if not is_upgrade and http_ws_index >= 0:
         _send_status(
             context.stream.value(),
             426,

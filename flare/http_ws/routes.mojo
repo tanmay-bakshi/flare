@@ -10,16 +10,16 @@ from flare.ws.server import WsConnection, WsHandler
 from flare.ws._subprotocol import _validate_subprotocols
 
 
-comptime _WsServeThunk = def(Int, mut WsConnection) raises thin -> None
+comptime _WsServeThunk = def(Int, var WsConnection) raises thin -> None
 comptime _WsDestroyThunk = def(Int) thin -> None
 
 
 def _serve_ws_route[
     W: WsHandler
-](address: Int, mut connection: WsConnection) raises:
+](address: Int, var connection: WsConnection) raises:
     """Copy one registered handler and run one connection through it."""
     var handler = Pool[W].get_ptr(address)[].copy()
-    handler.on_connection(connection)
+    handler.on_connection(connection^)
 
 
 def _destroy_ws_route[W: WsHandler](address: Int):
@@ -75,9 +75,9 @@ struct _HttpWsDispatch[H: Handler & Copyable](Copyable, Movable):
     def _serve_http(self, var request: Request) raises -> Response:
         return self._http_handler.serve(request^).lower()
 
-    def _serve_ws(self, index: Int, mut connection: WsConnection) raises:
+    def _serve_ws(self, index: Int, var connection: WsConnection) raises:
         var address = self._ws[].handler_addresses[index]
-        self._ws[].serve_thunks[index](address, connection)
+        self._ws[].serve_thunks[index](address, connection^)
 
 
 struct HttpWsRoutes[H: Handler & Copyable](Movable):

@@ -33,11 +33,11 @@ def _echo(mut conn: WsConnection) raises:
 
     Signature matches :meth:`flare.ws.WsServer.serve`'s
     ``def(mut WsConnection) raises thin -> None`` exactly --
-    ``mut`` so the body can call ``conn.recv()`` /
+    ``mut`` so the body can call ``conn.recv(8 * 1024 * 1024)`` /
     ``conn.send_text()`` (both ``mut self``).
     """
     while True:
-        var frame = conn.recv()
+        var frame = conn.recv(8 * 1024 * 1024)
         if frame.opcode == WsOpcode.CLOSE:
             break
         if frame.opcode == WsOpcode.TEXT:
@@ -67,7 +67,7 @@ def test_ws_multicore_serve_4_workers_echo_round_trip() raises:
             with WsClient.connect(url) as c:
                 var msg = String("hello-") + String(i)
                 c.send_text(msg)
-                var f = c.recv()
+                var f = c.recv(8 * 1024 * 1024)
                 assert_equal(f.opcode, WsOpcode.TEXT)
                 assert_equal(f.text_payload(), msg)
                 n_echoed += 1

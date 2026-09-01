@@ -12,7 +12,7 @@ Real-world usage:
 
     def on_connect(conn: WsConnection) raises:
         while True:
-            var frame = conn.recv()
+            var frame = conn.recv(8 * 1024 * 1024)
             if frame.opcode == WsOpcode.CLOSE:
                 break
             conn.send_text(frame.text_payload()) # echo
@@ -187,7 +187,7 @@ def main() raises:
     var wire = text_frame.encode(mask=True)  # client frames MUST be masked
     client1.write_all(Span[UInt8, _](wire))
 
-    var received = conn1.recv()
+    var received = conn1.recv(8 * 1024 * 1024)
     print(" Server received opcode:", received.opcode, "(expect 1 = TEXT)")
     print(" Payload:", received.text_payload())
 
@@ -217,7 +217,7 @@ def main() raises:
     var bin_wire = bin_frame.encode(mask=True)
     client2.write_all(Span[UInt8, _](bin_wire))
 
-    var bin_received = conn2.recv()
+    var bin_received = conn2.recv(8 * 1024 * 1024)
     print(" opcode:", bin_received.opcode, "(expect 2 = BINARY)")
     print(" payload bytes:", len(bin_received.payload))
     conn2.send_binary(bin_received.payload)  # echo
@@ -244,7 +244,7 @@ def main() raises:
     var dummy = WsFrame.text("done")
     var dummy_wire = dummy.encode(mask=True)
     client3.write_all(Span[UInt8, _](dummy_wire))
-    var done_frame = conn3.recv()
+    var done_frame = conn3.recv(8 * 1024 * 1024)
     print(" Received after PONG:", done_frame.text_payload())
     print()
 

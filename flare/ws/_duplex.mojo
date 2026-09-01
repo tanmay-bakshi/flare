@@ -10,7 +10,15 @@ from std.sys.info import CompilationTarget
 
 from ._message import WsMessage
 from ._transport import _WsStream
-from .frame import WsFrame, WsOpcode, _encode_client_frame
+from .frame import (
+    WsCloseCode,
+    WsFrame,
+    WsOpcode,
+    WsProtocolError,
+    _WsFrameHeader,
+    _encode_client_frame,
+    _inspect_frame_header,
+)
 from ..net import NetworkError
 from ..net._libc import INVALID_FD, _shutdown, SHUT_RDWR
 from ..runtime.event import Event, INTEREST_READ, INTEREST_WRITE
@@ -436,12 +444,24 @@ struct _WsDuplexState(Movable):
     var pending_wire: List[UInt8]
     var active_command_id: Int64
     var completed_command_id: Int64
+    var mask_outbound: Bool
+    var expect_masked_inbound: Bool
+    var max_message_bytes: Int
+    var local_close_started: UInt8
+    var local_close_command_id: Int64
+    var local_close_published: UInt8
+    var peer_close_received: UInt8
 
     def __init__(
         out self,
         var stream: _WsStream,
         control: ArcPointer[_WsControl],
+        mask_outbound: Bool,
+        expect_masked_inbound: Bool,
+        max_message_bytes: Int,
     ) raises:
+        if max_message_bytes <= 0:
+            raise Error("WebSocket max_message_bytes must be positive")
         var raw_fd = stream.fd()
         if not control[].attach_fd(raw_fd):
             if control[].begin_owner_close(raw_fd):
@@ -471,10 +491,65 @@ struct _WsDuplexState(Movable):
         self.pending_wire = List[UInt8]()
         self.active_command_id = 0
         self.completed_command_id = 0
+        self.mask_outbound = mask_outbound
+        self.expect_masked_inbound = expect_masked_inbound
+        self.max_message_bytes = max_message_bytes
+        self.local_close_started = UInt8(0)
+        self.local_close_command_id = 0
+        self.local_close_published = UInt8(0)
+        self.peer_close_received = UInt8(0)
+
+    def encode_outbound(self, frame: WsFrame) raises -> List[UInt8]:
+        """Encode one frame according to this endpoint's RFC 6455 role."""
+        if self.mask_outbound:
+            return _encode_client_frame(frame)
+        return frame.encode(mask=False)
+
+    def begin_local_close(mut self) -> Bool:
+        """Fence later application sends behind the first local CLOSE."""
+        self.control[].sync.lock()
+        if _load_u8(self.local_close_started) != UInt8(0):
+            self.control[].sync.unlock()
+            return False
+        if self.is_stopping():
+            self.control[].sync.unlock()
+            return False
+        _store_u8(self.local_close_started, UInt8(1))
+        self.control[].sync.unlock()
+        return True
+
+    def note_peer_close(mut self) -> Bool:
+        """Publish peer CLOSE and report whether an echo is still owed."""
+        self.control[].sync.lock()
+        _store_u8(self.peer_close_received, UInt8(1))
+        var echo = _load_u8(self.local_close_published) == UInt8(0)
+        if _load_u8(self.local_close_started) == UInt8(0):
+            _store_u8(self.local_close_started, UInt8(1))
+        self.control[].sync.broadcast()
+        self.control[].sync.unlock()
+        return echo
+
+    def wait_for_peer_close(mut self, deadline_ns: Int64) raises -> Bool:
+        """Wait until the peer CLOSE or the caller's absolute deadline wins."""
+        self.control[].sync.lock()
+        while True:
+            if _load_u8(self.peer_close_received) != UInt8(0):
+                self.control[].sync.unlock()
+                return True
+            if self.is_stopping():
+                var message = self.control[].failure_message.copy()
+                self.control[].sync.unlock()
+                raise NetworkError(
+                    message if message != "" else "WebSocket close interrupted"
+                )
+            if monotonic_now_ns() >= deadline_ns:
+                self.control[].sync.unlock()
+                return False
+            _ = self.control[].sync.wait_until(deadline_ns)
 
     def send(mut self, var wire: List[UInt8]) raises:
         """Queue one frame and wait for owner-loop publication."""
-        var published = self._send(wire^, 0)
+        var published = self._send(wire^, 0, False)
         if not published:
             abort("untimed WebSocket send reached a deadline")
 
@@ -487,12 +562,35 @@ struct _WsDuplexState(Movable):
                 "WebSocket send deadline must be a positive absolute "
                 "monotonic timestamp"
             )
-        return self._send(wire^, deadline_ns)
+        return self._send(wire^, deadline_ns, False)
 
-    def _send(
+    def close_until(
         mut self, var wire: List[UInt8], deadline_ns: Int64
     ) raises -> Bool:
+        """Fence sends, publish CLOSE in order, then await the peer CLOSE."""
+        if not self.begin_local_close():
+            raise NetworkError("WebSocket close already started")
+        var published = self._send(wire^, deadline_ns, True)
+        if not published:
+            self.stop("WebSocket close publication deadline expired")
+            return False
+        var acknowledged = self.wait_for_peer_close(deadline_ns)
+        if not acknowledged:
+            self.stop("WebSocket close handshake deadline expired")
+            return False
+        self.stop("WebSocket close handshake complete")
+        return True
+
+    def _send(
+        mut self,
+        var wire: List[UInt8],
+        deadline_ns: Int64,
+        closing: Bool,
+    ) raises -> Bool:
         self.control[].sync.lock()
+        if closing and _load_u8(self.peer_close_received) != UInt8(0):
+            self.control[].sync.unlock()
+            return True
         if self.is_stopping():
             var message = self.control[].failure_message.copy()
             self.control[].sync.unlock()
@@ -502,16 +600,33 @@ struct _WsDuplexState(Movable):
         if deadline_ns != 0 and monotonic_now_ns() >= deadline_ns:
             self.control[].sync.unlock()
             return False
-        if (
+        if not closing and _load_u8(self.local_close_started) != UInt8(0):
+            self.control[].sync.unlock()
+            raise NetworkError("WebSocket close has started")
+        while (
             _load_i64(self.pending_command_id) != 0
             or _load_i64(self.active_command_id) != 0
         ):
-            self.control[].sync.unlock()
-            raise NetworkError(
-                "WsSender supports exactly one sending thread per connection"
-            )
+            if not closing:
+                self.control[].sync.unlock()
+                raise NetworkError(
+                    "WsSender supports exactly one sending thread per"
+                    " connection"
+                )
+            if self.is_stopping():
+                var message = self.control[].failure_message.copy()
+                self.control[].sync.unlock()
+                raise NetworkError(
+                    message if message != "" else "WebSocket close interrupted"
+                )
+            if monotonic_now_ns() >= deadline_ns:
+                self.control[].sync.unlock()
+                return False
+            _ = self.control[].sync.wait_until(deadline_ns)
         self.next_command_id += 1
         var command_id = self.next_command_id
+        if closing:
+            _store_i64(self.local_close_command_id, command_id)
         self.pending_wire = wire^
         _store_i64(self.pending_command_id, command_id)
         self.control[].sync.unlock()
@@ -523,6 +638,9 @@ struct _WsDuplexState(Movable):
 
         self.control[].sync.lock()
         while True:
+            if closing and _load_u8(self.peer_close_received) != UInt8(0):
+                self.control[].sync.unlock()
+                return True
             var now_ns = monotonic_now_ns() if deadline_ns != 0 else Int64(0)
             var wake = _classify_send_wake(
                 self.load_completed_command_id(),
@@ -569,6 +687,8 @@ struct _WsDuplexState(Movable):
         if _load_i64(self.active_command_id) == command_id:
             _store_i64(self.active_command_id, 0)
             _store_i64(self.completed_command_id, command_id)
+            if _load_i64(self.local_close_command_id) == command_id:
+                _store_u8(self.local_close_published, UInt8(1))
             self.control[].sync.broadcast()
         self.control[].sync.unlock()
 
@@ -631,7 +751,7 @@ struct WsSender(Movable):
 
     def send_frame(mut self, frame: WsFrame) raises:
         """Send one frame through the receiver-owned stream."""
-        var wire = _encode_client_frame(frame)
+        var wire = self._shared[].encode_outbound(frame)
         self._shared[].send(wire^)
 
     def send_frame_within(
@@ -646,7 +766,7 @@ struct WsSender(Movable):
         after ``False`` and must never attempt another send.
         """
         var deadline_ns = _send_deadline_ns(timeout_ms)
-        var wire = _encode_client_frame(frame)
+        var wire = self._shared[].encode_outbound(frame)
         return self._shared[].send_until(wire^, deadline_ns)
 
 
@@ -654,13 +774,69 @@ struct WsShutdown(Movable):
     """Independent shutdown handle spanning connect and duplex I/O."""
 
     var _control: ArcPointer[_WsControl]
+    var _shared: Optional[ArcPointer[_WsDuplexState]]
 
     def __init__(out self, control: ArcPointer[_WsControl]):
         self._control = control
+        self._shared = Optional[ArcPointer[_WsDuplexState]]()
+
+    def __init__(
+        out self,
+        control: ArcPointer[_WsControl],
+        shared: ArcPointer[_WsDuplexState],
+    ):
+        self._control = control
+        self._shared = Optional[ArcPointer[_WsDuplexState]](shared)
 
     def shutdown(mut self):
         """Interrupt the socket and wake a receiver blocked in its reactor."""
         self._control[].stop("WebSocket duplex shut down")
+
+    def close_within(
+        mut self,
+        timeout_ms: Int,
+        code: UInt16 = WsCloseCode.NORMAL,
+        reason: String = "",
+    ) raises -> Bool:
+        """Close a split connection within one end-to-end handshake bound.
+
+        This authority fences the application sender, waits for its one
+        in-flight publication, serializes CLOSE behind it, and then waits for
+        the peer CLOSE. ``False`` means the deadline won and SHUT_RDWR fired.
+        """
+        if not self._shared:
+            raise Error("WebSocket close requires an established split")
+        var deadline_ns = _send_deadline_ns(timeout_ms)
+        var frame = WsFrame.close(code, reason)
+        var wire = self._shared.value()[].encode_outbound(frame)
+        return self._shared.value()[].close_until(wire^, deadline_ns)
+
+
+struct WsPreadmissionRelease(Movable):
+    """Idempotent release of shared-listener pre-admission stop ownership."""
+
+    var _context: Int
+    var _release: def(Int) thin -> None
+    var _released: Bool
+
+    def __init__(
+        out self,
+        context: Int,
+        release: def(Int) thin -> None,
+    ):
+        self._context = context
+        self._release = release
+        self._released = False
+
+    def __deinit__(deinit self):
+        self.release()
+
+    def release(mut self):
+        """Release the retained fd ledger entry at most once."""
+        if self._released:
+            return
+        self._released = True
+        self._release(self._context)
 
 
 struct WsReceiver(Movable):
@@ -683,6 +859,8 @@ struct WsReceiver(Movable):
     var _control_wire: List[UInt8]
     var _control_pending: Bool
     var _events: List[Event]
+    var _fragment_open: Bool
+    var _fragment_bytes: Int
 
     def __init__(out self, shared: ArcPointer[_WsDuplexState]):
         self._shared = shared
@@ -697,6 +875,8 @@ struct WsReceiver(Movable):
         self._control_wire = List[UInt8]()
         self._control_pending = False
         self._events = List[Event]()
+        self._fragment_open = False
+        self._fragment_bytes = 0
 
     def __deinit__(deinit self):
         self._shared[].stop("WebSocket receiver closed")
@@ -909,8 +1089,103 @@ struct WsReceiver(Movable):
         while self._out_command_id != 0 or self._control_pending:
             self._drive_outbound_once(False)
 
+    def _publish_terminal_control_once(mut self):
+        """Give a terminal control frame one non-blocking publication step."""
+        try:
+            self._load_outbound(False)
+            if self._out_command_id != 0:
+                _ = self._write_once()
+        except:
+            pass
+
+    def _reject(mut self, code: UInt16, message: String) raises:
+        """Publish a truthful protocol CLOSE before terminal shutdown."""
+        try:
+            var close = WsFrame.close(code, message)
+            self._control_wire = self._shared[].encode_outbound(close)
+            self._control_pending = True
+            self._publish_terminal_control_once()
+        except:
+            pass
+        self._terminate(message)
+        raise WsProtocolError(message)
+
+    def _validate_header(mut self) raises -> Bool:
+        """Validate declared size and fragmentation before payload allocation.
+        """
+        var inspected: Optional[_WsFrameHeader]
+        try:
+            inspected = _inspect_frame_header(Span[UInt8, _](self._read_buffer))
+        except error:
+            self._reject(WsCloseCode.PROTOCOL_ERROR, String(error))
+            return False
+        if not inspected:
+            return False
+        var header = inspected.value().copy()
+        if header.masked != self._shared[].expect_masked_inbound:
+            self._reject(
+                WsCloseCode.PROTOCOL_ERROR,
+                (
+                    "client frame must be masked" if self._shared[].expect_masked_inbound else "server frame must not be masked"
+                ),
+            )
+            return False
+
+        var opcode = header.opcode
+        if opcode == WsOpcode.CONTINUATION:
+            if not self._fragment_open:
+                self._reject(
+                    WsCloseCode.PROTOCOL_ERROR,
+                    "continuation frame without an open message",
+                )
+                return False
+            if (
+                header.payload_length
+                > self._shared[].max_message_bytes - self._fragment_bytes
+            ):
+                self._reject(WsCloseCode.MESSAGE_TOO_BIG, "message_too_big")
+                return False
+        elif opcode == WsOpcode.TEXT or opcode == WsOpcode.BINARY:
+            if self._fragment_open:
+                self._reject(
+                    WsCloseCode.PROTOCOL_ERROR,
+                    "new data frame before fragmented message completion",
+                )
+                return False
+            if header.payload_length > self._shared[].max_message_bytes:
+                self._reject(WsCloseCode.MESSAGE_TOO_BIG, "message_too_big")
+                return False
+        elif (
+            opcode != WsOpcode.CLOSE
+            and opcode != WsOpcode.PING
+            and opcode != WsOpcode.PONG
+        ):
+            self._reject(WsCloseCode.PROTOCOL_ERROR, "unknown WebSocket opcode")
+            return False
+
+        return (
+            len(self._read_buffer)
+            >= header.header_length + header.payload_length
+        )
+
+    def _record_fragment(mut self, frame: WsFrame):
+        """Advance complete-message accounting after one decoded data frame."""
+        if frame.opcode == WsOpcode.CONTINUATION:
+            self._fragment_bytes += len(frame.payload)
+            if frame.fin:
+                self._fragment_open = False
+                self._fragment_bytes = 0
+            return
+        if (
+            frame.opcode == WsOpcode.TEXT or frame.opcode == WsOpcode.BINARY
+        ) and not frame.fin:
+            self._fragment_open = True
+            self._fragment_bytes = len(frame.payload)
+
     def _try_decode(mut self) raises -> Optional[WsFrame]:
         if len(self._read_buffer) == 0:
+            return Optional[WsFrame]()
+        if not self._validate_header():
             return Optional[WsFrame]()
         try:
             var result = WsFrame.decode_one(Span[UInt8, _](self._read_buffer))
@@ -922,6 +1197,7 @@ struct WsReceiver(Movable):
             for index in range(consumed, len(self._read_buffer)):
                 remainder.append(self._read_buffer[index])
             self._read_buffer = remainder^
+            self._record_fragment(frame)
             return Optional[WsFrame](frame^)
         except error:
             var message = String(error)
@@ -944,11 +1220,24 @@ struct WsReceiver(Movable):
             var frame = decoded.take()
             if frame.opcode == WsOpcode.PING:
                 var pong = WsFrame.pong(frame.payload)
-                self._control_wire = _encode_client_frame(pong)
+                self._control_wire = self._shared[].encode_outbound(pong)
                 self._control_pending = True
                 self._flush_control()
                 continue
             if frame.opcode == WsOpcode.CLOSE:
+                var echo = self._shared[].note_peer_close()
+                if echo:
+                    var response = WsFrame(
+                        opcode=WsOpcode.CLOSE, payload=frame.payload
+                    )
+                    try:
+                        self._control_wire = self._shared[].encode_outbound(
+                            response
+                        )
+                        self._control_pending = True
+                        self._publish_terminal_control_once()
+                    except:
+                        pass
                 self._terminate("WebSocket CLOSE received")
                 return frame^
             self._service_one_outbound_step()
@@ -956,20 +1245,44 @@ struct WsReceiver(Movable):
 
     def recv_message(mut self) raises -> WsMessage:
         """Receive one complete text or binary message."""
-        var frame = self.recv()
+        var frame: WsFrame
+        while True:
+            frame = self.recv()
+            if frame.opcode == WsOpcode.PONG:
+                continue
+            break
         if frame.opcode == WsOpcode.CLOSE:
             raise NetworkError("WebSocket CLOSE received")
-        if frame.opcode == WsOpcode.BINARY:
-            return WsMessage(frame.payload)
+        if frame.opcode != WsOpcode.TEXT and frame.opcode != WsOpcode.BINARY:
+            self._terminate("unexpected frame while receiving a message")
+            raise WsProtocolError("unexpected frame while receiving a message")
+        var opcode = frame.opcode
+        var message_complete = frame.fin
+        var payload = frame.payload.copy()
+        while not message_complete:
+            frame = self.recv()
+            if frame.opcode == WsOpcode.PONG:
+                continue
+            if frame.opcode == WsOpcode.CLOSE:
+                raise NetworkError("WebSocket CLOSE received")
+            if frame.opcode != WsOpcode.CONTINUATION:
+                self._terminate("fragmented message interrupted")
+                raise WsProtocolError("fragmented message interrupted")
+            message_complete = frame.fin
+            for byte in frame.payload:
+                payload.append(byte)
+        if opcode == WsOpcode.BINARY:
+            return WsMessage(payload^)
         try:
-            return WsMessage(frame.text_payload())
+            var complete = WsFrame(opcode=WsOpcode.TEXT, payload=payload^)
+            return WsMessage(complete.text_payload())
         except error:
             self._terminate(String(error))
             raise error^
 
 
 struct WsDuplex(Movable):
-    """Move-only carrier returned by :meth:`WsClient.split`.
+    """Move-only carrier returned by client or accepted-server ``split``.
 
     Mojo tuples cannot transfer several move-only elements by destructuring.
     This carrier gives each endpoint an explicit one-time take operation while
@@ -979,16 +1292,19 @@ struct WsDuplex(Movable):
     var _sender: Optional[WsSender]
     var _receiver: Optional[WsReceiver]
     var _shutdown: Optional[WsShutdown]
+    var _preadmission_release: Optional[WsPreadmissionRelease]
 
     def __init__(
         out self,
         var sender: WsSender,
         var receiver: WsReceiver,
         var shutdown: WsShutdown,
+        var preadmission_release: Optional[WsPreadmissionRelease] = None,
     ):
         self._sender = Optional[WsSender](sender^)
         self._receiver = Optional[WsReceiver](receiver^)
         self._shutdown = Optional[WsShutdown](shutdown^)
+        self._preadmission_release = preadmission_release^
 
     def take_sender(mut self) raises -> WsSender:
         """Take the sending endpoint exactly once."""
@@ -1008,20 +1324,56 @@ struct WsDuplex(Movable):
             raise Error("WsDuplex shutdown already taken")
         return self._shutdown.take()
 
+    def take_preadmission_release(mut self) raises -> WsPreadmissionRelease:
+        """Take shared-listener ownership release exactly once.
+
+        Register the duplex shutdown handle with the next lifecycle owner
+        before calling ``release()``. If not taken, destroying this carrier
+        conservatively releases the ledger entry at connection close.
+        """
+        if not self._preadmission_release:
+            raise Error("WebSocket pre-admission release is unavailable")
+        return self._preadmission_release.take()
+
 
 def _split_stream(
     var stream: _WsStream,
     control: ArcPointer[_WsControl],
+    max_message_bytes: Int,
+    mask_outbound: Bool = True,
+    expect_masked_inbound: Bool = False,
+    var preadmission_release: Optional[WsPreadmissionRelease] = None,
 ) raises -> WsDuplex:
     """Create duplex endpoints under an existing connection authority."""
-    var shared = ArcPointer[_WsDuplexState](_WsDuplexState(stream^, control))
+    var shared = ArcPointer[_WsDuplexState](
+        _WsDuplexState(
+            stream^,
+            control,
+            mask_outbound,
+            expect_masked_inbound,
+            max_message_bytes,
+        )
+    )
     var sender = WsSender(shared)
     var receiver = WsReceiver(shared)
-    var shutdown = WsShutdown(control)
-    return WsDuplex(sender^, receiver^, shutdown^)
+    var shutdown = WsShutdown(control, shared)
+    return WsDuplex(sender^, receiver^, shutdown^, preadmission_release^)
 
 
-def _split_stream(var stream: _WsStream) raises -> WsDuplex:
+def _split_stream(
+    var stream: _WsStream,
+    max_message_bytes: Int,
+    mask_outbound: Bool = True,
+    expect_masked_inbound: Bool = False,
+    var preadmission_release: Optional[WsPreadmissionRelease] = None,
+) raises -> WsDuplex:
     """Create duplex endpoints for the blocking-connect compatibility path."""
     var control = ArcPointer[_WsControl](_WsControl())
-    return _split_stream(stream^, control)
+    return _split_stream(
+        stream^,
+        control,
+        max_message_bytes,
+        mask_outbound,
+        expect_masked_inbound,
+        preadmission_release^,
+    )

@@ -503,7 +503,7 @@ from flare.ws import WsClient
 def main() raises:
     with WsClient.connect("ws://echo.websocket.events") as ws:
         ws.send_text("hello")
-        var msg = ws.recv_message()
+        var msg = ws.recv_message(max_message_bytes=65536)
         if msg.is_text:
             print(msg.as_text())
 ```
@@ -575,7 +575,7 @@ from flare.ws import WsClient, WsFrame
 def main() raises:
     var ws = WsClient.connect("ws://echo.websocket.events")
     ws.send_text("ping")
-    var frame = ws.recv()
+    var frame = ws.recv(max_message_bytes=65536)
     print(frame.text_payload())
     ws.close()
 ```

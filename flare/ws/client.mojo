@@ -39,7 +39,15 @@ from ._subprotocol import (
     _trim_http_ows,
 )
 from ._transport import _WsStream
-from .frame import WsFrame, WsOpcode, _encode_client_frame
+from .frame import (
+    WsCloseCode,
+    WsFrame,
+    WsOpcode,
+    WsProtocolError,
+    _WsFrameHeader,
+    _encode_client_frame,
+    _inspect_frame_header,
+)
 from ..crypto.base64 import base64_encode as _base64_encode
 from ..http.url import Url
 from ..tls import TlsConfig, TlsStream
@@ -929,7 +937,7 @@ struct WsClient(Movable):
         ```mojo
         with WsClient.connect("wss://echo.websocket.events") as ws:
             ws.send_text("hello")
-            var msg = ws.recv_message()
+            var msg = ws.recv_message(max_message_bytes=65536)
             print(msg.as_text())
         ```
     """
@@ -938,6 +946,9 @@ struct WsClient(Movable):
     var _key: String
     var _control: ArcPointer[_WsControl]
     var _negotiated_subprotocol: Optional[String]
+    var _read_buffer: List[UInt8]
+    var _fragment_open: Bool
+    var _fragment_bytes: Int
 
     def __init__(
         out self,
@@ -950,11 +961,14 @@ struct WsClient(Movable):
         self._key = key
         self._control = control
         self._negotiated_subprotocol = negotiated_subprotocol^
+        self._read_buffer = List[UInt8](capacity=4096)
+        self._fragment_open = False
+        self._fragment_bytes = 0
 
     def __deinit__(deinit self):
         _close_stream_owner(self._control, self._stream)
 
-    def split(deinit self) raises -> WsDuplex:
+    def split(deinit self, max_message_bytes: Int) raises -> WsDuplex:
         """Split an established connection into two I/O halves and shutdown.
 
         The receiving application thread is the sole owner of the non-blocking
@@ -964,11 +978,19 @@ struct WsClient(Movable):
         receiver blocked in ``recv``.
 
         The receiver must be actively driving ``recv`` or ``recv_message``
-        while sends are in flight. No internal thread is created.
+        while sends are in flight. ``max_message_bytes`` is a required,
+        positive cap on each complete inbound message, including fragmented
+        totals. No internal thread is created.
         """
         _ = self._key^
         _ = self._negotiated_subprotocol^
-        return _split_stream(self._stream^, self._control)
+        return _split_stream(
+            self._stream^,
+            self._control,
+            max_message_bytes,
+            mask_outbound=True,
+            expect_masked_inbound=False,
+        )
 
     def negotiated_subprotocol(self) -> Optional[String]:
         """Return the server-selected protocol, if negotiation occurred."""
@@ -1143,7 +1165,7 @@ struct WsClient(Movable):
 
     # ── Receiving ─────────────────────────────────────────────────────────────
 
-    def recv(mut self) raises -> WsFrame:
+    def recv(mut self, max_message_bytes: Int) raises -> WsFrame:
         """Receive the next data frame, handling PING transparently.
 
         Automatically replies to PING frames with a PONG and continues
@@ -1158,7 +1180,7 @@ struct WsClient(Movable):
             Error: On truncated frame data.
         """
         while True:
-            var frame = self._recv_one()
+            var frame = self._recv_one(max_message_bytes)
             if frame.opcode == WsOpcode.PING:
                 # RFC 6455 §5.5.3: respond with PONG carrying same payload
                 var pong = WsFrame.pong(frame.payload)
@@ -1167,36 +1189,113 @@ struct WsClient(Movable):
                 continue
             return frame^
 
-    def _recv_one(mut self) raises -> WsFrame:
+    def _reject_inbound(mut self, code: UInt16, message: String) raises:
+        try:
+            var close = WsFrame.close(code, message)
+            var wire = _encode_client_frame(close)
+            self._stream.write_all(Span[UInt8, _](wire))
+        except:
+            pass
+        _close_stream_owner(self._control, self._stream)
+        raise WsProtocolError(message)
+
+    def _validate_inbound_header(
+        mut self, header: _WsFrameHeader, max_message_bytes: Int
+    ) raises:
+        if header.masked:
+            self._reject_inbound(
+                WsCloseCode.PROTOCOL_ERROR, "server frame must not be masked"
+            )
+        if header.opcode == WsOpcode.CONTINUATION:
+            if not self._fragment_open:
+                self._reject_inbound(
+                    WsCloseCode.PROTOCOL_ERROR,
+                    "continuation frame without an open message",
+                )
+            if header.payload_length > max_message_bytes - self._fragment_bytes:
+                self._reject_inbound(
+                    WsCloseCode.MESSAGE_TOO_BIG, "message_too_big"
+                )
+            return
+        if header.opcode == WsOpcode.TEXT or header.opcode == WsOpcode.BINARY:
+            if self._fragment_open:
+                self._reject_inbound(
+                    WsCloseCode.PROTOCOL_ERROR,
+                    "new data frame before fragmented message completion",
+                )
+            if header.payload_length > max_message_bytes:
+                self._reject_inbound(
+                    WsCloseCode.MESSAGE_TOO_BIG, "message_too_big"
+                )
+            return
+        if (
+            header.opcode != WsOpcode.CLOSE
+            and header.opcode != WsOpcode.PING
+            and header.opcode != WsOpcode.PONG
+        ):
+            self._reject_inbound(
+                WsCloseCode.PROTOCOL_ERROR, "unknown WebSocket opcode"
+            )
+
+    def _record_inbound_fragment(mut self, frame: WsFrame):
+        if frame.opcode == WsOpcode.CONTINUATION:
+            self._fragment_bytes += len(frame.payload)
+            if frame.fin:
+                self._fragment_open = False
+                self._fragment_bytes = 0
+            return
+        if (
+            frame.opcode == WsOpcode.TEXT or frame.opcode == WsOpcode.BINARY
+        ) and not frame.fin:
+            self._fragment_open = True
+            self._fragment_bytes = len(frame.payload)
+
+    def _recv_one(mut self, max_message_bytes: Int) raises -> WsFrame:
         """Read raw bytes from the stream and decode one frame."""
-        # Read bytes incrementally until we have a full frame
-        var buf = List[UInt8](capacity=4096)
+        if max_message_bytes <= 0:
+            raise Error("WebSocket max_message_bytes must be positive")
         var tmp = List[UInt8](capacity=4096)
         tmp.resize(4096, 0)
 
         while True:
+            var inspected = Optional[_WsFrameHeader]()
             try:
-                var result = WsFrame.decode_one(Span[UInt8, _](buf))
-                return result^.take_frame()
-            except e:
-                var msg = String(e)
-                if (
-                    "need at least" in msg
-                    or "need " in msg
-                    or "truncated" in msg
-                ):
-                    # Read more bytes and retry
-                    var n = self._stream.read(tmp.unsafe_ptr(), len(tmp))
-                    if n == 0:
-                        raise NetworkError(
-                            "WebSocket connection closed unexpectedly"
-                        )
-                    for i in range(n):
-                        buf.append(tmp[i])
-                else:
-                    raise e^
+                inspected = _inspect_frame_header(
+                    Span[UInt8, _](self._read_buffer)
+                )
+            except error:
+                self._reject_inbound(WsCloseCode.PROTOCOL_ERROR, String(error))
+            var needed = 14 - len(self._read_buffer)
+            if inspected:
+                var header = inspected.value().copy()
+                self._validate_inbound_header(header, max_message_bytes)
+                var total = header.header_length + header.payload_length
+                if len(self._read_buffer) >= total:
+                    var result = WsFrame.decode_one(
+                        Span[UInt8, _](self._read_buffer)
+                    )
+                    var consumed = result.consumed
+                    var frame = result^.take_frame()
+                    var remainder = List[UInt8](
+                        capacity=len(self._read_buffer) - consumed
+                    )
+                    for index in range(consumed, len(self._read_buffer)):
+                        remainder.append(self._read_buffer[index])
+                    self._read_buffer = remainder^
+                    self._record_inbound_fragment(frame)
+                    return frame^
+                needed = total - len(self._read_buffer)
+            if needed > len(tmp):
+                needed = len(tmp)
+            if needed <= 0:
+                needed = 1
+            var count = self._stream.read(tmp.unsafe_ptr(), needed)
+            if count == 0:
+                raise NetworkError("WebSocket connection closed unexpectedly")
+            for index in range(count):
+                self._read_buffer.append(tmp[index])
 
-    def recv_message(mut self) raises -> WsMessage:
+    def recv_message(mut self, max_message_bytes: Int) raises -> WsMessage:
         """Receive the next complete message as a ``WsMessage``.
 
         A higher-level alternative to ``recv()`` that returns a
@@ -1214,18 +1313,34 @@ struct WsClient(Movable):
 
         Example:
             ```mojo
-            var msg = ws.recv_message()
+            var msg = ws.recv_message(max_message_bytes=65536)
             if msg.is_text:
                 print(msg.as_text())
             ```
         """
-        var frame = self.recv()
+        var frame = self.recv(max_message_bytes)
         if frame.opcode == WsOpcode.CLOSE:
             raise NetworkError("WebSocket CLOSE received")
-        if frame.opcode == WsOpcode.BINARY:
-            return WsMessage(frame.payload)
-        # TEXT or anything else: return as text
-        return WsMessage(frame.text_payload())
+        if frame.opcode != WsOpcode.TEXT and frame.opcode != WsOpcode.BINARY:
+            raise WsProtocolError("unexpected frame while receiving a message")
+        var opcode = frame.opcode
+        var message_complete = frame.fin
+        var payload = frame.payload.copy()
+        while not message_complete:
+            frame = self.recv(max_message_bytes)
+            if frame.opcode == WsOpcode.PONG:
+                continue
+            if frame.opcode == WsOpcode.CLOSE:
+                raise NetworkError("WebSocket CLOSE received")
+            if frame.opcode != WsOpcode.CONTINUATION:
+                raise WsProtocolError("fragmented message interrupted")
+            message_complete = frame.fin
+            for byte in frame.payload:
+                payload.append(byte)
+        if opcode == WsOpcode.BINARY:
+            return WsMessage(payload^)
+        var complete = WsFrame(opcode=WsOpcode.TEXT, payload=payload^)
+        return WsMessage(complete.text_payload())
 
     # ── Context manager ───────────────────────────────────────────────────────
 

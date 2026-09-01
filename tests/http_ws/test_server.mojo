@@ -14,10 +14,11 @@ from flare.http_ws import (
 from flare.net import SocketAddr
 from flare.runtime._libc_time import monotonic_now_ms
 from flare.runtime._thread import ThreadHandle, _OpaquePtr
-from flare.tcp import TcpStream
+from flare.tcp import TcpListener, TcpStream
 from flare.utils import usleep
 from flare.ws import WsClient, WsConnection, WsHandler, WsOpcode
 from flare.ws._duplex import _DuplexSync
+from flare.http_ws.server import _HttpWsServerState
 
 
 comptime _WAIT_MS = 2_000
@@ -121,11 +122,12 @@ struct _WebSocketHandler(Copyable, Movable, WsHandler):
     var route: Int
     var probe: ArcPointer[_Probe]
 
-    def on_connection(mut self, mut connection: WsConnection) raises:
+    def on_connection(mut self, var connection: WsConnection) raises:
+        connection.release_preadmission()
         self.probe[].enter_ws(self.route)
         try:
             while True:
-                var frame = connection.recv()
+                var frame = connection.recv(max_message_bytes=65_536)
                 if frame.opcode == WsOpcode.CLOSE:
                     break
                 if frame.text_payload() == "fail":
@@ -331,20 +333,28 @@ def test_dispatch_matrix_and_route_identity() raises:
 
     var ws_path_http: String
     var http_path_upgrade: String
+    var query_upgrade: String
+    var query_http: String
     var health: String
     try:
         ws_path_http = _raw_get(port, "/ws/a")
         http_path_upgrade = _raw_upgrade(port, "/healthz")
+        query_upgrade = _raw_upgrade(port, "/ws/a?trace=1")
+        query_http = _raw_get(port, "/ws/a?trace=1")
         health = _raw_get(port, "/healthz")
 
         var first = WsClient.connect(_url(port, "/ws/a"))
         first.send_text("which")
-        assert_equal(first.recv().text_payload(), "route=1")
+        assert_equal(
+            first.recv(max_message_bytes=65_536).text_payload(), "route=1"
+        )
         first.close()
 
         var second = WsClient.connect(_url(port, "/ws/b"))
         second.send_text("which")
-        assert_equal(second.recv().text_payload(), "route=2")
+        assert_equal(
+            second.recv(max_message_bytes=65_536).text_payload(), "route=2"
+        )
         second.close()
         _wait_for_active(probe.copy(), 0)
     except error:
@@ -355,10 +365,170 @@ def test_dispatch_matrix_and_route_identity() raises:
     assert_true(" 426 " in ws_path_http, ws_path_http)
     assert_true(" 400 " in http_path_upgrade, http_path_upgrade)
     assert_false(" 101 " in http_path_upgrade, http_path_upgrade)
+    assert_true(" 400 " in query_upgrade, query_upgrade)
+    assert_false(" 101 " in query_upgrade, query_upgrade)
+    assert_true(" 426 " in query_http, query_http)
     assert_true(" 200 " in health, health)
     assert_equal(probe[].http_calls(), 1)
     assert_equal(probe[].ws_a_entered(), 1)
     assert_equal(probe[].ws_b_entered(), 1)
+
+
+struct _OverlapProbe(Movable):
+    """Synchronise a stop inside the split-to-release overlap."""
+
+    var _sync: _DuplexSync
+    var _split_ready: Bool
+    var _may_release: Bool
+    var _receive_failed: Bool
+
+    def __init__(out self):
+        self._sync = _DuplexSync()
+        self._split_ready = False
+        self._may_release = False
+        self._receive_failed = False
+
+    def mark_split(mut self):
+        self._sync.lock()
+        self._split_ready = True
+        self._sync.unlock()
+
+    def split_ready(mut self) -> Bool:
+        self._sync.lock()
+        var ready = self._split_ready
+        self._sync.unlock()
+        return ready
+
+    def allow_release(mut self):
+        self._sync.lock()
+        self._may_release = True
+        self._sync.unlock()
+
+    def may_release(mut self) -> Bool:
+        self._sync.lock()
+        var allowed = self._may_release
+        self._sync.unlock()
+        return allowed
+
+    def finish(mut self, receive_failed: Bool):
+        self._sync.lock()
+        self._receive_failed = receive_failed
+        self._sync.unlock()
+
+    def receive_failed(mut self) -> Bool:
+        self._sync.lock()
+        var failed = self._receive_failed
+        self._sync.unlock()
+        return failed
+
+
+@fieldwise_init
+struct _OverlapHandler(Copyable, Movable, WsHandler):
+    var probe: ArcPointer[_OverlapProbe]
+
+    def on_connection(mut self, var connection: WsConnection) raises:
+        var duplex = connection^.split(max_message_bytes=65_536)
+        var preadmission = duplex.take_preadmission_release()
+        _ = duplex.take_sender()
+        var receiver = duplex.take_receiver()
+        _ = duplex.take_shutdown()
+        self.probe[].mark_split()
+        while not self.probe[].may_release():
+            usleep(1_000)
+        preadmission.release()
+        preadmission.release()
+        var failed = False
+        try:
+            _ = receiver.recv()
+        except:
+            failed = True
+        self.probe[].finish(failed)
+
+
+def _overlap_routes(
+    probe: ArcPointer[_OverlapProbe],
+) raises -> HttpWsRoutes[_HttpHandler]:
+    var http_probe = ArcPointer[_Probe](_Probe())
+    var routes = HttpWsRoutes[_HttpHandler](_HttpHandler(http_probe))
+    routes.websocket("/ws", _OverlapHandler(probe))
+    return routes^
+
+
+def test_stop_reaches_split_before_preadmission_release() raises:
+    var probe = ArcPointer[_OverlapProbe](_OverlapProbe())
+    var server = HttpWsServer.bind(
+        SocketAddr.localhost(0),
+        max_connections=2,
+        header_timeout_ms=1_000,
+        max_header_bytes=4096,
+    )
+    var port = server.local_addr().port
+    var runtime = server^.serve_stoppable(_overlap_routes(probe.copy()))
+    var stop: HttpWsServerStop
+    try:
+        stop = runtime.take_stop()
+    except error:
+        runtime^.stop_and_join()
+        raise error^
+    var client: WsClient
+    try:
+        client = WsClient.connect(_url(port, "/ws"))
+    except error:
+        stop.stop()
+        runtime^.join()
+        raise error^
+    var deadline = monotonic_now_ms() + _WAIT_MS
+    while not probe[].split_ready():
+        if monotonic_now_ms() >= deadline:
+            stop.stop()
+            probe[].allow_release()
+            runtime^.join()
+            raise Error("handler did not reach split before stop")
+        usleep(1_000)
+
+    stop.stop()
+    probe[].allow_release()
+    runtime^.join()
+    client.close()
+    assert_true(
+        probe[].receive_failed(),
+        "stop missed the retained pre-admission fd during handoff",
+    )
+
+
+def test_stale_preadmission_release_cannot_clear_reused_slot() raises:
+    var state = ArcPointer[_HttpWsServerState](_HttpWsServerState(1))
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var first_peer = TcpStream.connect(listener.local_addr())
+    var first = listener.accept()
+    var first_fd = first._socket.fd
+    var slot = state[].reserve(first_fd)
+    assert_equal(slot, 0)
+    assert_true(state[].claim_after_parse(slot, first_fd))
+    state[].release_preadmission(slot, first_fd)
+    state[].release_preadmission(slot, first_fd)
+    state[].complete(slot)
+    assert_true(state[].take_done(slot))
+    state[].mark_free(slot)
+
+    var second_peer = TcpStream.connect(listener.local_addr())
+    var second = listener.accept()
+    var second_fd = second._socket.fd
+    assert_true(second_fd != first_fd)
+    assert_equal(state[].reserve(second_fd), slot)
+    assert_true(state[].claim_after_parse(slot, second_fd))
+    state[].release_preadmission(slot, first_fd)
+    state[].request_stop()
+    assert_true(
+        _wait_for_close(second_peer, 500),
+        "stale release cleared the new fd occupying the slot",
+    )
+    state[].complete(slot)
+    first.close()
+    first_peer.close()
+    second.close()
+    second_peer.close()
+    listener.close()
 
 
 def test_concurrent_websockets_do_not_block_http() raises:
@@ -719,7 +889,7 @@ def test_handler_failure_isolated_to_one_connection() raises:
         var failed = WsClient.connect(_url(port, "/ws/a"))
         failed.send_text("fail")
         try:
-            _ = failed.recv()
+            _ = failed.recv(max_message_bytes=65_536)
         except:
             pass
         failed.close()
@@ -764,6 +934,8 @@ def test_worker_error_surfaces_only_from_join() raises:
 def main() raises:
     test_requires_positive_resource_bounds()
     test_dispatch_matrix_and_route_identity()
+    test_stop_reaches_split_before_preadmission_release()
+    test_stale_preadmission_release_cannot_clear_reused_slot()
     test_concurrent_websockets_do_not_block_http()
     test_saturation_returns_503_before_upgrade_and_recovers()
     test_partial_handshakes_count_toward_saturation()
@@ -773,4 +945,4 @@ def main() raises:
     test_idle_and_stalled_header_stop_join_promptly()
     test_handler_failure_isolated_to_one_connection()
     test_worker_error_surfaces_only_from_join()
-    print("test_http_ws_server: 11 passed")
+    print("test_http_ws_server: 13 passed")

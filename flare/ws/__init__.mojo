@@ -21,8 +21,10 @@ from flare.ws import (
   the consuming `split` operation.
 - `WsConnectAttempt` — cancellable DNS-through-Upgrade attempt with an
   absolute handshake deadline and a shutdown handle available before dialing.
-- `WsDuplex` — Linear carrier returned by `WsClient.split()` for one sender
-  thread, one receiver thread, and an independent shutdown owner.
+- `WsDuplex` — Linear carrier returned by client or accepted-server
+  ``split(max_message_bytes)`` for one sender thread, one receiver thread, and
+  an independent shutdown/close owner. The cap covers complete messages,
+  including fragmented totals.
 - `WsSender.send_*_within` — duplex publication within a positive millisecond
   timeout. A `False` result requires immediate shutdown.
 - `WsServer` — WebSocket server: upgrades HTTP connections and selects the
@@ -48,13 +50,13 @@ def main() raises:
     ws.send_text("hello, flare!")
 
     # Receive echo
-    var frame = ws.recv()
+    var frame = ws.recv(max_message_bytes=65536)
     if frame.opcode == WsOpcode.TEXT:
         print(frame.text_payload()) # hello, flare!
 
     # Ping / pong
     ws.send_frame(WsFrame.ping())
-    var pong = ws.recv() # WsOpcode.PONG
+    var pong = ws.recv(max_message_bytes=65536) # WsOpcode.PONG
 
     # Clean close
     ws.close()
@@ -69,7 +71,7 @@ from flare.tls import TlsConfig
 def main() raises:
     var ws = WsClient.connect("wss://echo.websocket.events", TlsConfig())
     ws.send_text("secure hello")
-    var frame = ws.recv()
+    var frame = ws.recv(max_message_bytes=65536)
     print(frame.text_payload())
     ws.close()
 ```
@@ -81,7 +83,7 @@ from flare.tls import TlsConfig
 from flare.ws import WsClient
 
 var ws = WsClient.connect("wss://example.com/stream", TlsConfig())
-var duplex = ws^.split()
+var duplex = ws^.split(max_message_bytes=65536)
 var sender = duplex.take_sender()
 var receiver = duplex.take_receiver()
 var shutdown = duplex.take_shutdown()
@@ -133,6 +135,7 @@ from .client import (
     WsShutdown,
     WsDuplex,
 )
+from ._duplex import WsPreadmissionRelease
 from .server import (
     WsHandler,
     WsServer,

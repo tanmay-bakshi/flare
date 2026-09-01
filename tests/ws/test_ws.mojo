@@ -417,7 +417,7 @@ def test_ws_echo_roundtrip() raises:
         # The echo server may send a welcome message first; read until we see ours
         var found = False
         for _ in range(5):
-            var frame = ws.recv()
+            var frame = ws.recv(8 * 1024 * 1024)
             if "flare test ping" in frame.text_payload():
                 found = True
                 break
@@ -521,7 +521,7 @@ def test_ws_server_text_echo_loopback() raises:
     raw_client.write_all(Span[UInt8, _](client_wire))
 
     # ── Server: receive
-    var frame = conn.recv()
+    var frame = conn.recv(8 * 1024 * 1024)
     assert_equal(frame.opcode, WsOpcode.TEXT)
     assert_equal(frame.text_payload(), "hi")
 
@@ -572,7 +572,7 @@ def test_ws_server_binary_echo_loopback() raises:
     var bin_wire = bin_frame.encode(mask=True)
     raw_client.write_all(Span[UInt8, _](bin_wire))
 
-    var frame = conn.recv()
+    var frame = conn.recv(8 * 1024 * 1024)
     assert_equal(frame.opcode, WsOpcode.BINARY)
     assert_equal(len(frame.payload), 3)
     assert_equal(frame.payload[0], UInt8(0xDE))
@@ -624,7 +624,7 @@ def test_ws_server_unmasked_frame_rejected() raises:
     raw_client.write_all(Span[UInt8, _](bad_frame))
 
     with assert_raises():
-        _ = conn.recv()
+        _ = conn.recv(8 * 1024 * 1024)
 
     raw_client.close()
     srv.close()

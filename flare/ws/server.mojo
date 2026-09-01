@@ -18,7 +18,12 @@ from std.ffi import ErrNo, OwnedDLHandle, c_int, get_errno
 from std.memory import ArcPointer, Pointer, UnsafePointer
 from std.memory.alloc import unsafe_alloc
 
-from ._duplex import _DuplexSync
+from ._duplex import (
+    _DuplexSync,
+    _split_stream,
+    WsDuplex,
+    WsPreadmissionRelease,
+)
 from ._subprotocol import (
     _is_http_token,
     _parse_subprotocol_offers,
@@ -26,7 +31,15 @@ from ._subprotocol import (
     _trim_http_ows,
     _validate_subprotocols,
 )
-from .frame import WsFrame, WsOpcode, WsCloseCode, WsProtocolError
+from ._transport import _WsStream
+from .frame import (
+    WsFrame,
+    WsOpcode,
+    WsCloseCode,
+    WsProtocolError,
+    _WsFrameHeader,
+    _inspect_frame_header,
+)
 from ..crypto.base64 import base64_encode as _b64_encode_srv
 from ..http.response import Status
 from ..tcp import TcpListener, TcpStream
@@ -430,7 +443,7 @@ struct WsConnection(Movable):
     Example:
         ```mojo
         def on_connect(conn: WsConnection) raises:
-            var frame = conn.recv()
+            var frame = conn.recv(max_message_bytes=65536)
             conn.send_text(frame.text_payload()) # echo back
 
         var srv = WsServer.bind(SocketAddr.localhost(9001))
@@ -442,6 +455,10 @@ struct WsConnection(Movable):
     var _peer: SocketAddr
     var _upgrade: WsUpgradeRequest
     var _negotiated_subprotocol: Optional[String]
+    var _preadmission_release: Optional[WsPreadmissionRelease]
+    var _read_buffer: List[UInt8]
+    var _fragment_open: Bool
+    var _fragment_bytes: Int
 
     def __init__(
         out self,
@@ -449,11 +466,16 @@ struct WsConnection(Movable):
         peer: SocketAddr,
         var upgrade: WsUpgradeRequest,
         var negotiated_subprotocol: Optional[String] = None,
+        var preadmission_release: Optional[WsPreadmissionRelease] = None,
     ):
         self._stream = stream^
         self._peer = peer
         self._upgrade = upgrade^
         self._negotiated_subprotocol = negotiated_subprotocol^
+        self._preadmission_release = preadmission_release^
+        self._read_buffer = List[UInt8](capacity=4096)
+        self._fragment_open = False
+        self._fragment_bytes = 0
 
     def upgrade_request(self) -> WsUpgradeRequest:
         """Return a copy of the parsed HTTP Upgrade request."""
@@ -462,6 +484,32 @@ struct WsConnection(Movable):
     def negotiated_subprotocol(self) -> Optional[String]:
         """Return the protocol selected during the opening handshake."""
         return self._negotiated_subprotocol.copy()
+
+    def release_preadmission(mut self):
+        """Release shared-listener stop ownership for an unsplit handler."""
+        if not self._preadmission_release:
+            return
+        var release = self._preadmission_release.take()
+        release.release()
+
+    def split(deinit self, max_message_bytes: Int) raises -> WsDuplex:
+        """Split an accepted connection into sender, receiver, and shutdown.
+
+        The receiver is the sole stream owner. Application sends and automatic
+        PONG/CLOSE replies share its serialized owner loop. The required
+        ``max_message_bytes`` cap applies to complete inbound messages,
+        including fragmented totals, before declared payload allocation.
+        """
+        _ = self._peer
+        _ = self._upgrade^
+        _ = self._negotiated_subprotocol^
+        return _split_stream(
+            _WsStream(self._stream^),
+            max_message_bytes,
+            mask_outbound=False,
+            expect_masked_inbound=True,
+            preadmission_release=self._preadmission_release^,
+        )
 
     def __deinit__(deinit self):
         self._stream.close()
@@ -508,7 +556,7 @@ struct WsConnection(Movable):
         var wire = frame.encode(mask=False)
         self._stream.write_all(Span[UInt8, _](wire))
 
-    def recv(mut self) raises -> WsFrame:
+    def recv(mut self, max_message_bytes: Int) raises -> WsFrame:
         """Receive the next data frame from the client.
 
         Automatically replies to PING frames with an unmasked PONG and
@@ -523,7 +571,7 @@ struct WsConnection(Movable):
             NetworkError: On I/O failure.
         """
         while True:
-            var frame = self._recv_one()
+            var frame = self._recv_one(max_message_bytes)
             if frame.opcode == WsOpcode.PING:
                 # RFC 6455 §5.5.3: respond with unmasked PONG
                 var pong = WsFrame.pong(frame.payload)
@@ -532,44 +580,121 @@ struct WsConnection(Movable):
                 continue
             return frame^
 
-    def _recv_one(mut self) raises -> WsFrame:
+    def _reject_inbound(mut self, code: UInt16, message: String) raises:
+        try:
+            var close = WsFrame.close(code, message)
+            var wire = close.encode(mask=False)
+            self._stream.write_all(Span[UInt8, _](wire))
+        except:
+            pass
+        self._stream.close()
+        raise WsProtocolError(message)
+
+    def _validate_inbound_header(
+        mut self, header: _WsFrameHeader, max_message_bytes: Int
+    ) raises:
+        if not header.masked:
+            self._reject_inbound(
+                WsCloseCode.PROTOCOL_ERROR, "client frame must be masked"
+            )
+        if header.opcode == WsOpcode.CONTINUATION:
+            if not self._fragment_open:
+                self._reject_inbound(
+                    WsCloseCode.PROTOCOL_ERROR,
+                    "continuation frame without an open message",
+                )
+            if header.payload_length > max_message_bytes - self._fragment_bytes:
+                self._reject_inbound(
+                    WsCloseCode.MESSAGE_TOO_BIG, "message_too_big"
+                )
+            return
+        if header.opcode == WsOpcode.TEXT or header.opcode == WsOpcode.BINARY:
+            if self._fragment_open:
+                self._reject_inbound(
+                    WsCloseCode.PROTOCOL_ERROR,
+                    "new data frame before fragmented message completion",
+                )
+            if header.payload_length > max_message_bytes:
+                self._reject_inbound(
+                    WsCloseCode.MESSAGE_TOO_BIG, "message_too_big"
+                )
+            return
+        if (
+            header.opcode != WsOpcode.CLOSE
+            and header.opcode != WsOpcode.PING
+            and header.opcode != WsOpcode.PONG
+        ):
+            self._reject_inbound(
+                WsCloseCode.PROTOCOL_ERROR, "unknown WebSocket opcode"
+            )
+
+    def _record_inbound_fragment(mut self, frame: WsFrame):
+        if frame.opcode == WsOpcode.CONTINUATION:
+            self._fragment_bytes += len(frame.payload)
+            if frame.fin:
+                self._fragment_open = False
+                self._fragment_bytes = 0
+            return
+        if (
+            frame.opcode == WsOpcode.TEXT or frame.opcode == WsOpcode.BINARY
+        ) and not frame.fin:
+            self._fragment_open = True
+            self._fragment_bytes = len(frame.payload)
+
+    def _recv_one(mut self, max_message_bytes: Int) raises -> WsFrame:
         """Read bytes from stream and decode one complete frame."""
-        var buf = List[UInt8](capacity=4096)
+        if max_message_bytes <= 0:
+            raise Error("WebSocket max_message_bytes must be positive")
         var tmp = List[UInt8](capacity=4096)
         tmp.resize(4096, 0)
 
         while True:
+            var inspected = Optional[_WsFrameHeader]()
             try:
-                var result = WsFrame.decode_one(Span[UInt8, _](buf))
-                # RFC 6455 §5.1: server MUST close conn if client sends unmasked frame
-                if not result.frame.masked:
-                    raise WsProtocolError(
-                        "client sent unmasked frame (RFC 6455 §5.1)"
+                inspected = _inspect_frame_header(
+                    Span[UInt8, _](self._read_buffer)
+                )
+            except error:
+                self._reject_inbound(WsCloseCode.PROTOCOL_ERROR, String(error))
+            var needed = 14 - len(self._read_buffer)
+            if inspected:
+                var header = inspected.value().copy()
+                self._validate_inbound_header(header, max_message_bytes)
+                var total = header.header_length + header.payload_length
+                if len(self._read_buffer) >= total:
+                    var result = WsFrame.decode_one(
+                        Span[UInt8, _](self._read_buffer)
                     )
-                return result^.take_frame()
-            except e:
-                var msg = String(e)
-                if (
-                    "need at least" in msg
-                    or "need " in msg
-                    or "truncated" in msg
-                ):
-                    var n = self._stream.read(tmp.unsafe_ptr(), len(tmp))
-                    if n == 0:
-                        raise NetworkError(
-                            "WebSocket connection closed unexpectedly"
-                        )
-                    for i in range(n):
-                        buf.append(tmp[i])
-                else:
-                    raise e^
+                    var consumed = result.consumed
+                    var frame = result^.take_frame()
+                    var remainder = List[UInt8](
+                        capacity=len(self._read_buffer) - consumed
+                    )
+                    for index in range(consumed, len(self._read_buffer)):
+                        remainder.append(self._read_buffer[index])
+                    self._read_buffer = remainder^
+                    self._record_inbound_fragment(frame)
+                    return frame^
+                needed = total - len(self._read_buffer)
+            if needed > len(tmp):
+                needed = len(tmp)
+            if needed <= 0:
+                needed = 1
+            var count = self._stream.read(tmp.unsafe_ptr(), needed)
+            if count == 0:
+                raise NetworkError("WebSocket connection closed unexpectedly")
+            for index in range(count):
+                self._read_buffer.append(tmp[index])
 
     def close(
         mut self,
         code: UInt16 = WsCloseCode.NORMAL,
         reason: String = "",
     ) raises:
-        """Send a CLOSE frame and wait for the client's CLOSE response.
+        """Best-effort one-way CLOSE for the legacy unsplit connection.
+
+        Use :meth:`split` and ``WsShutdown.close_within`` when shutdown must
+        wait for the peer CLOSE under a bounded end-to-end deadline.
 
         Args:
             code: Close status code (see ``WsCloseCode.*``).
@@ -608,8 +733,8 @@ trait WsHandler(Copyable, Deinitable, Movable):
     WS-over-h2 carrier once that bridge lands (carrier abstraction).
     """
 
-    def on_connection(mut self, mut conn: WsConnection) raises -> None:
-        """Run one established WebSocket connection to completion."""
+    def on_connection(mut self, var conn: WsConnection) raises -> None:
+        """Own one established WebSocket connection through completion."""
         ...
 
 
@@ -796,7 +921,7 @@ struct _WsThinHandler(Copyable, Movable, WsHandler):
 
     var handler: def(mut WsConnection) raises thin -> None
 
-    def on_connection(mut self, mut conn: WsConnection) raises:
+    def on_connection(mut self, var conn: WsConnection) raises:
         self.handler(conn)
 
 
@@ -816,7 +941,7 @@ struct WsServer(Movable):
         ```mojo
         def handle(conn: WsConnection) raises:
             while True:
-                var frame = conn.recv()
+                var frame = conn.recv(max_message_bytes=65536)
                 if frame.opcode == WsOpcode.CLOSE:
                     break
                 conn.send_text(frame.text_payload())
@@ -962,7 +1087,7 @@ struct WsServer(Movable):
                 var conn = _upgrade_ws_connection(
                     stream^, peer, self._subprotocols
                 )
-                handler.on_connection(conn)
+                handler.on_connection(conn^)
             except e:
                 print("[ws] connection error: " + String(e))
 
@@ -1178,7 +1303,7 @@ def _ws_stoppable_accept_loop[
                 return
             var conn = upgrade^.into_connection(stream^, peer)
             try:
-                context.handler.on_connection(conn)
+                context.handler.on_connection(conn^)
             except error:
                 if context.state[].is_stopping():
                     return

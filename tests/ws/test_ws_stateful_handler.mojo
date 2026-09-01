@@ -28,9 +28,9 @@ struct _CountingEcho(Copyable, Movable, WsHandler):
 
     var total: Int
 
-    def on_connection(mut self, mut conn: WsConnection) raises:
+    def on_connection(mut self, var conn: WsConnection) raises:
         while True:
-            var frame = conn.recv()
+            var frame = conn.recv(8 * 1024 * 1024)
             if frame.opcode == WsOpcode.CLOSE:
                 break
             if frame.opcode == WsOpcode.TEXT:
@@ -58,11 +58,11 @@ def main() raises:
         var url = String("ws://127.0.0.1:") + String(port) + String("/ws")
         var ws = WsClient.connect(url)
         ws.send_text("a")
-        replies.append(ws.recv().text_payload())
+        replies.append(ws.recv(8 * 1024 * 1024).text_payload())
         ws.send_text("b")
-        replies.append(ws.recv().text_payload())
+        replies.append(ws.recv(8 * 1024 * 1024).text_payload())
         ws.send_text("c")
-        replies.append(ws.recv().text_payload())
+        replies.append(ws.recv(8 * 1024 * 1024).text_payload())
     except e:
         print("ws stateful raised:", e)
         raised = True

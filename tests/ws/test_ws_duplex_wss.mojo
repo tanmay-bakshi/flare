@@ -870,7 +870,7 @@ def _plain_receiver_thread(argument: _OpaquePtr) -> _OpaquePtr:
 def _exercise_pressure_connection(
     var client: WsClient, process_id: Int, validation_text: String
 ) raises:
-    var duplex = client^.split()
+    var duplex = client^.split(8 * 1024 * 1024)
     var sender: WsSender = duplex.take_sender()
     var receiver: WsReceiver = duplex.take_receiver()
     var shutdown: WsShutdown = duplex.take_shutdown()
@@ -981,7 +981,7 @@ def test_public_split_over_wss_is_full_duplex_and_shutdown_safe() raises:
     var process_id: Int = _spawn_server(listener)
 
     var client: WsClient = _connect(port)
-    var duplex = client^.split()
+    var duplex = client^.split(8 * 1024 * 1024)
     var sender: WsSender = duplex.take_sender()
     var receiver: WsReceiver = duplex.take_receiver()
     var shutdown: WsShutdown = duplex.take_shutdown()
@@ -1057,7 +1057,7 @@ def test_shutdown_releases_sender_waiting_for_publication() raises:
     var process_id: Int = _spawn_server(listener)
 
     var client: WsClient = _connect(port)
-    var duplex = client^.split()
+    var duplex = client^.split(8 * 1024 * 1024)
     var sender: WsSender = duplex.take_sender()
     var receiver: WsReceiver = duplex.take_receiver()
     var shutdown: WsShutdown = duplex.take_shutdown()
@@ -1137,7 +1137,7 @@ def test_peer_close_releases_sender_without_publishing_later_frame() raises:
     var process_id: Int = _spawn_terminal_server(listener)
 
     var client: WsClient = _connect(port)
-    var duplex = client^.split()
+    var duplex = client^.split(8 * 1024 * 1024)
     var sender: WsSender = duplex.take_sender()
     var receiver: WsReceiver = duplex.take_receiver()
     var shutdown: WsShutdown = duplex.take_shutdown()
@@ -1209,7 +1209,7 @@ def test_public_split_over_plain_ws_is_full_duplex() raises:
     var process_id: Int = _spawn_plain_server(listener)
 
     var client: WsClient = _connect_plain(port)
-    var duplex = client^.split()
+    var duplex = client^.split(8 * 1024 * 1024)
     var sender: WsSender = duplex.take_sender()
     var receiver: WsReceiver = duplex.take_receiver()
     var shutdown: WsShutdown = duplex.take_shutdown()
@@ -1275,7 +1275,7 @@ def test_wss_split_preserves_frame_coalesced_with_upgrade() raises:
     var process_id: Int = _spawn_coalesced_upgrade_server(listener)
 
     var client: WsClient = _connect(port)
-    var duplex = client^.split()
+    var duplex = client^.split(8 * 1024 * 1024)
     var receiver: WsReceiver = duplex.take_receiver()
     var shutdown: WsShutdown = duplex.take_shutdown()
     var sender: WsSender = duplex.take_sender()
@@ -1447,8 +1447,8 @@ def test_connect_attempt_predial_shutdown_survives_connect_and_split() raises:
     var predial_shutdown = attempt.take_shutdown()
     var client = attempt^.connect()
     client.send_text("continuity-proof")
-    var echo = client.recv()
-    var duplex = client^.split()
+    var echo = client.recv(8 * 1024 * 1024)
+    var duplex = client^.split(8 * 1024 * 1024)
     var sender = duplex.take_sender()
     var receiver = duplex.take_receiver()
     var split_shutdown = duplex.take_shutdown()

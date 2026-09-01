@@ -63,10 +63,10 @@ struct _CountingEcho(Copyable, Movable, WsHandler):
     var total: Int
     var probe: ArcPointer[_Probe]
 
-    def on_connection(mut self, mut connection: WsConnection) raises:
+    def on_connection(mut self, var connection: WsConnection) raises:
         self.probe[].add_entered()
         while True:
-            var frame = connection.recv()
+            var frame = connection.recv(8 * 1024 * 1024)
             if frame.opcode == WsOpcode.CLOSE:
                 break
             if frame.text_payload() == "fail":
@@ -77,7 +77,7 @@ struct _CountingEcho(Copyable, Movable, WsHandler):
 
 
 def _thin_echo(mut connection: WsConnection) raises:
-    var frame = connection.recv()
+    var frame = connection.recv(8 * 1024 * 1024)
     if frame.opcode == WsOpcode.TEXT:
         connection.send_text(frame.text_payload())
 
@@ -126,7 +126,7 @@ def test_stateful_echo_then_idle_stop_and_join() raises:
     try:
         var first = WsClient.connect(_url(port))
         first.send_text("one")
-        assert_equal(first.recv().text_payload(), "count=1")
+        assert_equal(first.recv(8 * 1024 * 1024).text_payload(), "count=1")
         first.close()
 
         for _ in range(100):
@@ -137,7 +137,7 @@ def test_stateful_echo_then_idle_stop_and_join() raises:
 
         var second = WsClient.connect(_url(port))
         second.send_text("two")
-        assert_equal(second.recv().text_payload(), "count=2")
+        assert_equal(second.recv(8 * 1024 * 1024).text_payload(), "count=2")
         second.close()
 
         for _ in range(100):
@@ -150,7 +150,7 @@ def test_stateful_echo_then_idle_stop_and_join() raises:
         failed.send_text("fail")
         var handler_failed = False
         try:
-            _ = failed.recv()
+            _ = failed.recv(8 * 1024 * 1024)
         except:
             handler_failed = True
         failed.close()
@@ -158,7 +158,7 @@ def test_stateful_echo_then_idle_stop_and_join() raises:
 
         var third = WsClient.connect(_url(port))
         third.send_text("three")
-        assert_equal(third.recv().text_payload(), "count=3")
+        assert_equal(third.recv(8 * 1024 * 1024).text_payload(), "count=3")
         third.close()
 
         for _ in range(100):
@@ -197,7 +197,7 @@ def test_independent_stop_is_idempotent_and_take_is_one_shot() raises:
     try:
         var client = WsClient.connect(_url(port))
         client.send_text("thin")
-        assert_equal(client.recv().text_payload(), "thin")
+        assert_equal(client.recv(8 * 1024 * 1024).text_payload(), "thin")
         client.close()
     except error:
         stop.stop()
@@ -290,7 +290,7 @@ def test_stop_during_handler_drains_and_fences_new_admission() raises:
     try:
         var first = WsClient.connect(_url(port))
         first.send_text("active")
-        assert_equal(first.recv().text_payload(), "count=1")
+        assert_equal(first.recv(8 * 1024 * 1024).text_payload(), "count=1")
         assert_equal(probe[].load_entered(), 1)
 
         stop.stop()

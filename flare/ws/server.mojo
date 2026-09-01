@@ -49,6 +49,7 @@ from ..runtime._thread import ThreadHandle, _OpaquePtr
 from ..runtime.event import Event, INTEREST_READ
 from ..runtime.reactor import Reactor
 from ..runtime.reuseport import bind_reuseport
+from ..tls import TlsAcceptor, TlsServerConfig, TlsStream
 from ..utils.dylib import dl_sym
 
 # RFC 6455 §1.3 magic GUID
@@ -348,13 +349,13 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> WsUpgradeRequest:
     )
 
 
-def _read_upgrade_request(mut stream: TcpStream) raises -> WsUpgradeRequest:
+def _read_upgrade_request(mut stream: _WsStream) raises -> WsUpgradeRequest:
     """Read an HTTP upgrade request from a stream.
 
     Reads until the blank line terminating HTTP headers.
 
     Args:
-        stream: Accepted TCP stream.
+        stream: Accepted plain or TLS WebSocket stream.
 
     Returns:
         The parsed ``WsUpgradeRequest``.
@@ -398,15 +399,13 @@ def _negotiate_subprotocol(
     return _select_subprotocol(offered, supported)
 
 
-def _send_upgrade_response(
-    mut stream: TcpStream,
+def _upgrade_response(
     accept: String,
     subprotocol: Optional[String] = None,
-) raises:
-    """Send the 101 Switching Protocols response.
+) -> String:
+    """Build the one canonical 101 Switching Protocols response.
 
     Args:
-        stream: TCP stream for the client connection.
         accept: The computed ``Sec-WebSocket-Accept`` value.
     """
     var resp = (
@@ -420,8 +419,28 @@ def _send_upgrade_response(
     if subprotocol:
         resp += "Sec-WebSocket-Protocol: " + subprotocol.value() + "\r\n"
     resp += "\r\n"
+    return resp^
+
+
+def _send_upgrade_response(
+    mut stream: TcpStream,
+    accept: String,
+    subprotocol: Optional[String] = None,
+) raises:
+    """Send the shared 101 response over a plain TCP stream."""
+    var resp = _upgrade_response(accept, subprotocol)
     var resp_bytes = resp.as_bytes()
     stream.write_all(Span[UInt8, _](resp_bytes))
+
+
+def _send_upgrade_response(
+    mut stream: _WsStream,
+    accept: String,
+    subprotocol: Optional[String] = None,
+) raises:
+    """Send the shared 101 response over a plain or TLS stream."""
+    var resp = _upgrade_response(accept, subprotocol)
+    stream.write_all(Span[UInt8, _](resp.as_bytes()))
 
 
 # ── WsConnection ──────────────────────────────────────────────────────────────
@@ -436,7 +455,7 @@ struct WsConnection(Movable):
     This type is ``Movable`` but not ``Copyable``.
 
     Fields:
-        _stream: The underlying TCP stream.
+        _stream: The underlying plain or TLS stream.
         _peer: The remote socket address.
         _upgrade: The parsed HTTP Upgrade request that opened this connection.
 
@@ -451,7 +470,7 @@ struct WsConnection(Movable):
         ```
     """
 
-    var _stream: TcpStream
+    var _stream: _WsStream
     var _peer: SocketAddr
     var _upgrade: WsUpgradeRequest
     var _negotiated_subprotocol: Optional[String]
@@ -463,6 +482,23 @@ struct WsConnection(Movable):
     def __init__(
         out self,
         var stream: TcpStream,
+        peer: SocketAddr,
+        var upgrade: WsUpgradeRequest,
+        var negotiated_subprotocol: Optional[String] = None,
+        var preadmission_release: Optional[WsPreadmissionRelease] = None,
+    ):
+        self._stream = _WsStream(stream^)
+        self._peer = peer
+        self._upgrade = upgrade^
+        self._negotiated_subprotocol = negotiated_subprotocol^
+        self._preadmission_release = preadmission_release^
+        self._read_buffer = List[UInt8](capacity=4096)
+        self._fragment_open = False
+        self._fragment_bytes = 0
+
+    def __init__(
+        out self,
+        var stream: _WsStream,
         peer: SocketAddr,
         var upgrade: WsUpgradeRequest,
         var negotiated_subprotocol: Optional[String] = None,
@@ -504,7 +540,7 @@ struct WsConnection(Movable):
         _ = self._upgrade^
         _ = self._negotiated_subprotocol^
         return _split_stream(
-            _WsStream(self._stream^),
+            self._stream^,
             max_message_bytes,
             mask_outbound=False,
             expect_masked_inbound=True,
@@ -512,7 +548,7 @@ struct WsConnection(Movable):
         )
 
     def __deinit__(deinit self):
-        self._stream.close()
+        self._stream.close_abortive()
 
     def send_text(self, msg: String) raises:
         """Send a UTF-8 text message to the client.
@@ -587,7 +623,7 @@ struct WsConnection(Movable):
             self._stream.write_all(Span[UInt8, _](wire))
         except:
             pass
-        self._stream.close()
+        self._stream.close_abortive()
         raise WsProtocolError(message)
 
     def _validate_inbound_header(
@@ -928,14 +964,17 @@ struct _WsThinHandler(Copyable, Movable, WsHandler):
 struct WsServer(Movable):
     """A WebSocket server that upgrades incoming HTTP connections.
 
-    Accepts TCP connections, performs the HTTP Upgrade handshake, and
-    calls ``handler`` once per established WebSocket connection.
+    Accepts plain TCP or TLS-backed connections, performs one shared HTTP
+    Upgrade handshake, and calls ``handler`` once per established WebSocket
+    connection.
 
     This type is ``Movable`` but not ``Copyable``.
 
     Fields:
         _listener: The bound TCP listener.
         _subprotocols: Supported protocols in server preference order.
+        _tls_acceptor: Optional server-side TLS handshake policy.
+        _tls_config: Optional policy copy used by multicore workers.
 
     Example:
         ```mojo
@@ -953,6 +992,8 @@ struct WsServer(Movable):
 
     var _listener: TcpListener
     var _subprotocols: List[String]
+    var _tls_acceptor: Optional[TlsAcceptor]
+    var _tls_config: Optional[TlsServerConfig]
 
     def __init__(
         out self,
@@ -962,6 +1003,8 @@ struct WsServer(Movable):
         _validate_subprotocols(subprotocols)
         self._listener = listener^
         self._subprotocols = subprotocols.copy()
+        self._tls_acceptor = Optional[TlsAcceptor]()
+        self._tls_config = Optional[TlsServerConfig]()
 
     def __deinit__(deinit self):
         self._listener.close()
@@ -989,7 +1032,29 @@ struct WsServer(Movable):
         var listener = TcpListener.bind(addr)
         return WsServer(listener^, subprotocols)
 
-    def serve(self, handler: def(mut WsConnection) raises thin -> None) raises:
+    @staticmethod
+    def bind_tls(
+        addr: SocketAddr,
+        var config: TlsServerConfig,
+        subprotocols: List[String] = [],
+    ) raises -> WsServer:
+        """Bind a TLS-backed WebSocket server on ``addr``.
+
+        TLS completes before the existing HTTP Upgrade path. Established
+        connections retain the same :class:`WsConnection`, handler, split,
+        and stoppable-runtime surfaces as plaintext servers.
+        """
+        _validate_subprotocols(subprotocols)
+        var acceptor = TlsAcceptor(config.copy())
+        var listener = TcpListener.bind(addr)
+        var server = WsServer(listener^, subprotocols)
+        server._tls_acceptor = Optional[TlsAcceptor](acceptor^)
+        server._tls_config = Optional[TlsServerConfig](config^)
+        return server^
+
+    def serve(
+        mut self, handler: def(mut WsConnection) raises thin -> None
+    ) raises:
         """Accept WebSocket connections in a single-threaded loop.
 
         For each accepted TCP connection:
@@ -1013,7 +1078,13 @@ struct WsServer(Movable):
         while True:
             var stream = self._listener.accept()
             var peer = stream.peer_addr()
-            _handle_ws_connection(stream^, peer, handler, self._subprotocols)
+            _handle_ws_connection(
+                stream^,
+                peer,
+                handler,
+                self._subprotocols,
+                self._tls_acceptor,
+            )
 
     def serve(
         mut self,
@@ -1064,7 +1135,13 @@ struct WsServer(Movable):
         # silently swallow connections we never serve. The
         # SO_REUSEPORT listeners below take over the port.
         self._listener.close()
-        _ws_serve_multicore(addr, handler, num_workers, self._subprotocols)
+        _ws_serve_multicore(
+            addr,
+            handler,
+            num_workers,
+            self._subprotocols,
+            self._tls_config^,
+        )
 
     def serve[H: WsHandler](mut self, var handler: H) raises:
         """Accept WebSocket connections, dispatching each to a stateful
@@ -1085,7 +1162,10 @@ struct WsServer(Movable):
             var peer = stream.peer_addr()
             try:
                 var conn = _upgrade_ws_connection(
-                    stream^, peer, self._subprotocols
+                    stream^,
+                    peer,
+                    self._subprotocols,
+                    self._tls_acceptor,
                 )
                 handler.on_connection(conn^)
             except e:
@@ -1112,6 +1192,7 @@ struct WsServer(Movable):
         return _ws_serve_stoppable(
             self._listener^,
             self._subprotocols^,
+            self._tls_acceptor^,
             handler^,
         )
 
@@ -1128,6 +1209,7 @@ struct WsServer(Movable):
         return _ws_serve_stoppable(
             self._listener^,
             self._subprotocols^,
+            self._tls_acceptor^,
             adapted^,
         )
 
@@ -1152,7 +1234,7 @@ struct _WsUpgradeResult(Movable):
     var subprotocol: Optional[String]
 
     def into_connection(
-        deinit self, var stream: TcpStream, peer: SocketAddr
+        deinit self, var stream: _WsStream, peer: SocketAddr
     ) -> WsConnection:
         """Move this result and its stream into a server connection."""
         return WsConnection(
@@ -1163,7 +1245,7 @@ struct _WsUpgradeResult(Movable):
         )
 
 
-def _send_bad_upgrade_response(mut stream: TcpStream):
+def _send_bad_upgrade_response(mut stream: _WsStream):
     """Best-effort HTTP rejection before any WebSocket response is sent."""
     var response = (
         "HTTP/1.1 400 Bad Request\r\n"
@@ -1178,7 +1260,7 @@ def _send_bad_upgrade_response(mut stream: TcpStream):
 
 
 def _perform_ws_upgrade(
-    mut stream: TcpStream,
+    mut stream: _WsStream,
     subprotocols: List[String] = [],
 ) raises -> _WsUpgradeResult:
     """Complete the shared handshake while leaving stream ownership outside."""
@@ -1204,25 +1286,40 @@ def _perform_ws_upgrade(
 def _upgrade_ws_connection(
     var stream: TcpStream,
     peer: SocketAddr,
-    subprotocols: List[String] = [],
+    subprotocols: List[String],
+    mut tls_acceptor: Optional[TlsAcceptor],
 ) raises -> WsConnection:
-    """Upgrade one accepted TCP stream with the shared negotiation path."""
-    var result = _perform_ws_upgrade(stream, subprotocols)
-    return result^.into_connection(stream^, peer)
+    """Upgrade one accepted plain or TLS stream through one negotiation."""
+    var wire: _WsStream
+    if tls_acceptor:
+        # Finish every fallible adoption prerequisite while this scope still
+        # owns the TCP stream. Moving the fd before either step could close it
+        # during exception unwinding while a server stop slot still names it.
+        var server_lib = OwnedDLHandle(_find_flare_lib())
+        var ssl = tls_acceptor.value()._handshake_ssl(Int(stream._socket.fd))
+        var secure = TlsStream._adopt_server(stream^, ssl, server_lib^)
+        wire = _WsStream(secure^)
+    else:
+        wire = _WsStream(stream^)
+    var result = _perform_ws_upgrade(wire, subprotocols)
+    return result^.into_connection(wire^, peer)
 
 
 def _handle_ws_connection(
     var stream: TcpStream,
     peer: SocketAddr,
     handler: def(mut WsConnection) raises thin -> None,
-    subprotocols: List[String] = [],
+    subprotocols: List[String],
+    mut tls_acceptor: Optional[TlsAcceptor],
 ):
     """Perform the WebSocket handshake and call handler.
 
     Upgrade errors are swallowed so the accept loop continues.
     """
     try:
-        var conn = _upgrade_ws_connection(stream^, peer, subprotocols)
+        var conn = _upgrade_ws_connection(
+            stream^, peer, subprotocols, tls_acceptor
+        )
         handler(conn)
     except e:
         print("[ws] connection error: " + String(e))
@@ -1233,6 +1330,7 @@ struct _WsStoppableCtx[H: WsHandler](Movable):
 
     var listener: TcpListener
     var subprotocols: List[String]
+    var tls_acceptor: Optional[TlsAcceptor]
     var handler: Self.H
     var state: ArcPointer[_WsServerState]
 
@@ -1240,11 +1338,13 @@ struct _WsStoppableCtx[H: WsHandler](Movable):
         out self,
         var listener: TcpListener,
         var subprotocols: List[String],
+        var tls_acceptor: Optional[TlsAcceptor],
         var handler: Self.H,
         state: ArcPointer[_WsServerState],
     ):
         self.listener = listener^
         self.subprotocols = subprotocols^
+        self.tls_acceptor = tls_acceptor^
         self.handler = handler^
         self.state = state
 
@@ -1290,18 +1390,48 @@ def _ws_stoppable_accept_loop[
 
             var peer = stream.peer_addr()
             var upgrade: _WsUpgradeResult
+            var wire: _WsStream
+            if context.tls_acceptor:
+                try:
+                    # Keep the published fd in this outer-owned stream until
+                    # both fallible TLS prerequisites complete. The transfer
+                    # into ``wire`` is then non-raising, so the catch below can
+                    # clear the stop slot before any fd-owning value dies.
+                    var server_lib = OwnedDLHandle(_find_flare_lib())
+                    var ssl = context.tls_acceptor.value()._handshake_ssl(
+                        Int(handshake_fd)
+                    )
+                    var secure = TlsStream._adopt_server(
+                        stream^, ssl, server_lib^
+                    )
+                    wire = _WsStream(secure^)
+                except error:
+                    context.state[].clear_handshake(handshake_fd)
+                    if context.state[].is_stopping():
+                        return
+                    print("[ws] connection error: " + String(error))
+                    continue
+            else:
+                wire = _WsStream(stream^)
+
             try:
-                upgrade = _perform_ws_upgrade(stream, context.subprotocols)
+                upgrade = _perform_ws_upgrade(wire, context.subprotocols)
             except error:
+                # Clearing before close prevents a stale published fd from
+                # targeting a reused descriptor. The explicit abortive close
+                # then makes automatic destruction inert; a TLS close_notify
+                # exchange here could otherwise outlive the stop authority.
                 context.state[].clear_handshake(handshake_fd)
+                wire.close_abortive()
                 if context.state[].is_stopping():
                     return
                 print("[ws] connection error: " + String(error))
                 continue
 
             if not context.state[].claim_handler_after_handshake(handshake_fd):
+                wire.close_abortive()
                 return
-            var conn = upgrade^.into_connection(stream^, peer)
+            var conn = upgrade^.into_connection(wire^, peer)
             try:
                 context.handler.on_connection(conn^)
             except error:
@@ -1337,6 +1467,7 @@ def _ws_serve_stoppable[
 ](
     var listener: TcpListener,
     var subprotocols: List[String],
+    var tls_acceptor: Optional[TlsAcceptor],
     var handler: H,
 ) raises -> WsServerRuntime:
     """Spawn a stoppable worker after registering its listener fd."""
@@ -1354,6 +1485,7 @@ def _ws_serve_stoppable[
         _WsStoppableCtx[H](
             listener^,
             subprotocols^,
+            tls_acceptor^,
             handler^,
             state,
         )
@@ -1388,6 +1520,7 @@ struct _WsWorkerCtx(Movable):
     var listener: TcpListener
     var handler: def(mut WsConnection) raises thin -> None
     var subprotocols: List[String]
+    var tls_config: Optional[TlsServerConfig]
 
 
 def _ws_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
@@ -1411,6 +1544,11 @@ def _ws_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
     )
     var ctx_ptr = raw.unsafe_bitcast[_WsWorkerCtx]()
     try:
+        var tls_acceptor = Optional[TlsAcceptor]()
+        if ctx_ptr[].tls_config:
+            tls_acceptor = Optional[TlsAcceptor](
+                TlsAcceptor(ctx_ptr[].tls_config.value().copy())
+            )
         while True:
             var stream = ctx_ptr[].listener.accept()
             var peer = stream.peer_addr()
@@ -1419,6 +1557,7 @@ def _ws_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
                 peer,
                 ctx_ptr[].handler,
                 ctx_ptr[].subprotocols,
+                tls_acceptor,
             )
     except:
         pass
@@ -1434,6 +1573,7 @@ def _ws_serve_multicore(
     handler: def(mut WsConnection) raises thin -> None,
     num_workers: Int,
     subprotocols: List[String] = [],
+    tls_config: Optional[TlsServerConfig] = None,
 ) raises:
     """Spawn ``num_workers`` WebSocket worker threads sharing a port.
 
@@ -1475,7 +1615,12 @@ def _ws_serve_multicore(
 
     for i in range(num_workers):
         var listener = bind_reuseport(addr)
-        var ctx = _WsWorkerCtx(listener^, handler, subprotocols.copy())
+        var ctx = _WsWorkerCtx(
+            listener^,
+            handler,
+            subprotocols.copy(),
+            tls_config.copy(),
+        )
         var ctx_ptr = alloc[_WsWorkerCtx](1)
         debug_assert[assert_mode="safe"](
             Int(ctx_ptr) != 0,

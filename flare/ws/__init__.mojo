@@ -27,10 +27,11 @@ from flare.ws import (
   including fragmented totals.
 - `WsSender.send_*_within` — duplex publication within a positive millisecond
   timeout. A `False` result requires immediate shutdown.
-- `WsServer` — WebSocket server: upgrades HTTP connections and selects the
-  first server-preferred subprotocol offered by each client. Its consuming
-  `serve_stoppable` path returns a linear `WsServerRuntime` and an independent
-  `WsServerStop` admission fence.
+- `WsServer` — WebSocket server: `bind` serves plaintext and `bind_tls` accepts
+  `TlsServerConfig` for WSS. Both use the same Upgrade, connection, duplex,
+  subprotocol, and stoppable-runtime surfaces. Its consuming `serve_stoppable`
+  path returns a linear `WsServerRuntime` and an independent `WsServerStop`
+  admission fence.
 - `WsFrame` — A single WebSocket frame: `text`, `binary`, `ping`, `pong`, `close`.
 - `WsOpcode` — Opcode byte constants (`TEXT`, `BINARY`, `PING`, `PONG`, `CLOSE`).
 - `WsCloseCode` — Close status code constants (`NORMAL`, `GOING_AWAY`, …).

@@ -1,45 +1,9 @@
-"""Server-side TLS acceptor.
+"""Server-side TLS policy and accepted-connection handshakes.
 
-``TlsAcceptor`` is the server-side counterpart to ``TlsStream`` —
-it wraps a ``TcpListener`` and produces ``TlsStream`` connections
-after completing the TLS handshake against a server certificate
-chain. ``TlsServerConfig`` carries the acceptor's policy: cert /
-key paths, ALPN protocols to advertise, optional CA bundle for
-mTLS client-cert verification.
-
-This commit ships the **type infrastructure**: ``TlsServerConfig``,
-``TlsAcceptor`` shell, ``TlsInfo`` value type, ``TlsServerError``
-hierarchy, plus the public re-exports through ``flare.tls`` and
-the root ``flare`` package. The reactor-side handshake state
-machine — non-blocking ``SSL_accept`` driven by edge-triggered
-readable / writable events — is a focused follow-up that lands
-once the OpenSSL ``SSL_CTX_*`` server-side surface is wired into
-the existing ``flare/tls/ffi/openssl_wrapper.cpp``.
-
-Why split: the C-side handshake state machine is ~150 lines of
-``SSL_accept`` + ``SSL_get_error`` + ``BIO`` plumbing, plus
-matching reactor surgery. The API surface here lets per-request
-``TlsInfo`` plumbing, cert reload, and mTLS all plug into the
-public surface; the actual cipher-on-the-wire bits land
-together in a single follow-up.
-
-Public API:
-
-    from flare.tls import (
-        TlsServerConfig, TlsAcceptor, TlsInfo,
-        TlsServerError, TlsServerNotImplemented,
-    )
-
-    var cfg = TlsServerConfig(
-        cert_file="/etc/letsencrypt/live/example.com/fullchain.pem",
-        key_file="/etc/letsencrypt/live/example.com/privkey.pem",
-        alpn=["h2", "http/1.1"], # served preference order
-        require_client_cert=False, # mTLS off by default
-        client_ca_bundle="",
-    )
-    var acceptor = TlsAcceptor.bind(addr, cfg)
-    # acceptor.serve(handler) — flips on with the reactor
-    # follow-up that lands the SSL_accept state machine.
+``TlsAcceptor`` owns one reusable server ``SSL_CTX`` configured by
+``TlsServerConfig``. It drives TLS over accepted TCP descriptors, exposes
+negotiated metadata to low-level callers, and transfers completed sessions
+into ``TlsStream`` for higher-level servers.
 """
 
 from std.format import Writable, Writer
@@ -69,7 +33,7 @@ def _set_fd_recv_send_timeout(fd: Int, ms: Int):
     ignored (the loop deadline is still a backstop). ``timeval`` layout
     on 64-bit: 8-byte tv_sec + 8-byte tv_usec.
     """
-    if ms <= 0:
+    if ms < 0:
         return
     var tv = stack_allocation[16, UInt8]()
     for i in range(16):
@@ -301,15 +265,10 @@ struct TlsAcceptor(Movable):
     any are bad, so configuration errors fail at server-bind
     time rather than at the first inbound handshake.
 
-    Per-connection use:
-
-    1. After ``listener.accept()`` returns a ``TcpStream``, call
-       ``acceptor.handshake(stream) raises -> Tuple[TlsStream,
-       TlsInfo]``. The method drives ``SSL_accept`` to completion
-       in blocking mode (suitable for the existing ``serve``
-       entry shape; the reactor-side ``STATE_TLS_HANDSHAKE``
-       state machine that uses the same FFI but in a non-blocking
-       reactor loop is a focused follow-up).
+    ``handshake_fd`` drives TLS on an accepted descriptor and returns its
+    ``SSL*`` plus negotiated metadata. Higher-level servers use the internal
+    stream-transfer path so the resulting ``TlsStream`` owns the descriptor
+    and connection state together.
 
     Cert reload:
 
@@ -375,28 +334,8 @@ struct TlsAcceptor(Movable):
         """
         self._ctx.reload(self.config.cert_file, self.config.key_file)
 
-    def handshake_fd(mut self, fd: Int) raises -> Tuple[Int, TlsInfo]:
-        """Drive the ``SSL_accept`` state machine on ``fd`` to
-        completion (or fatal error) in blocking-poll mode. Sleeps
-        in 1ms slices between WANT_READ / WANT_WRITE returns.
-
-        Returns ``(ssl_addr, tls_info)`` — the caller owns the
-        ``ssl_addr`` and is responsible for calling
-        ``server_ssl_free(ctx, ssl_addr)`` when done. The
-        ``TlsInfo`` carries the negotiated ALPN protocol + SNI
-        hostname (live-populated from the OpenSSL handle).
-
-        Args:
-            fd: The accepted TCP fd (as returned by
-                ``TcpListener.accept().raw_fd()`` or similar).
-
-        Returns:
-            A ``(ssl_addr, tls_info)`` tuple.
-
-        Raises:
-            Error: On fatal handshake failure (cert mismatch,
-                client refused, etc.).
-        """
+    def _handshake_ssl(mut self, fd: Int) raises -> Int:
+        """Drive one blocking accepted handshake and return its ``SSL*``."""
         from ..runtime._libc_time import libc_nanosleep_ms, monotonic_now_ms
 
         var ssl_addr = server_ssl_new_accept(self._ctx, fd)
@@ -413,34 +352,58 @@ struct TlsAcceptor(Movable):
         # Deadline is measured against a monotonic clock (not an
         # iteration count) so a slow/stalled client cannot hold the
         # worker past ``handshake_timeout_ms`` even if the 1ms sleeps
-        # dilate under the libc-sleep multiplier. The reactor follow-up
-        # replaces this with poll-driven WANT_*-aware state transitions.
+        # dilate under the libc-sleep multiplier.
         var timeout_ms = self.config.handshake_timeout_ms
         # Bound a blocking SSL_accept read/write so a stalled client
         # cannot pin the worker inside the syscall past the deadline.
         _set_fd_recv_send_timeout(fd, timeout_ms)
         var deadline_ms = monotonic_now_ms() + timeout_ms
-        while True:
-            var rc = server_ssl_do_handshake(self._ctx, ssl_addr)
-            if rc == 0:
-                break
-            if rc < 0:
+        try:
+            while True:
+                var rc = server_ssl_do_handshake(self._ctx, ssl_addr)
+                if rc == 0:
+                    break
+                if rc < 0:
+                    raise Error("TLS handshake failed")
+                # WANT_READ or WANT_WRITE — yield and retry until the
+                # deadline (0 disables the cap).
+                if timeout_ms > 0 and monotonic_now_ms() >= deadline_ms:
+                    raise Error(
+                        "TLS handshake timed out (" + String(timeout_ms) + "ms)"
+                    )
+                _ = libc_nanosleep_ms(1)
+        except error:
+            try:
                 server_ssl_free(self._ctx, ssl_addr)
-                raise Error("TLS handshake failed")
-            # WANT_READ or WANT_WRITE — yield and retry until the
-            # deadline (0 disables the cap).
-            if timeout_ms > 0 and monotonic_now_ms() >= deadline_ms:
-                server_ssl_free(self._ctx, ssl_addr)
-                raise Error(
-                    "TLS handshake timed out (" + String(timeout_ms) + "ms)"
-                )
-            _ = libc_nanosleep_ms(1)
+            except:
+                pass
+            raise error^
 
-        # Pull live info.
-        var alpn = server_ssl_get_alpn_selected(self._ctx, ssl_addr)
-        var sni = server_ssl_get_sni_host(self._ctx, ssl_addr)
-        var info = TlsInfo(alpn_protocol=alpn, sni_host=sni)
-        return (ssl_addr, info^)
+        # The bound belongs to the opening handshake only. A successful
+        # accepted stream must recover normal blocking I/O semantics before
+        # the application protocol takes ownership.
+        _set_fd_recv_send_timeout(fd, 0)
+        return ssl_addr
+
+    def handshake_fd(mut self, fd: Int) raises -> Tuple[Int, TlsInfo]:
+        """Drive the ``SSL_accept`` state machine on ``fd`` to completion.
+
+        Returns ``(ssl_addr, tls_info)``. The caller owns ``ssl_addr`` and
+        must release it with ``server_ssl_free``. The metadata is read from
+        the completed connection before ownership transfers.
+        """
+        var ssl_addr = self._handshake_ssl(fd)
+        try:
+            var alpn = server_ssl_get_alpn_selected(self._ctx, ssl_addr)
+            var sni = server_ssl_get_sni_host(self._ctx, ssl_addr)
+            var info = TlsInfo(alpn_protocol=alpn, sni_host=sni)
+            return (ssl_addr, info^)
+        except error:
+            try:
+                server_ssl_free(self._ctx, ssl_addr)
+            except:
+                pass
+            raise error^
 
     def info_placeholder(self) -> TlsInfo:
         """Return a default ``TlsInfo`` value with empty strings

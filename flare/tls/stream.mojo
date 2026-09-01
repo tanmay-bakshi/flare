@@ -784,6 +784,21 @@ struct TlsStream(Movable, Readable):
         self._ssl = ssl
         self._lib = lib^
 
+    @staticmethod
+    def _adopt_server(
+        var tcp: TcpStream, ssl: Int, var lib: OwnedDLHandle
+    ) -> TlsStream:
+        """Adopt a completed server-side ``SSL*`` and its socket.
+
+        ``SSL_new`` retains the server context it was created from, so the
+        accepted connection owns only the ``SSL*`` and pins the FFI library.
+        A zero ``_ctx`` keeps the client-context release path inert while the
+        normal stream lifecycle continues to free the ``SSL*`` exactly once.
+        The caller prepares ``lib`` before moving the socket, making adoption
+        itself non-raising at publication-fenced server boundaries.
+        """
+        return TlsStream(tcp^, 0, ssl, lib^)
+
     def __deinit__(deinit self):
         """Send ``close_notify`` and free OpenSSL objects (best-effort)."""
         if self._ssl != 0:

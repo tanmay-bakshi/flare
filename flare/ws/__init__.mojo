@@ -9,7 +9,7 @@ clean close handshake. SIMD-accelerated payload masking for payloads ≥128 byte
 ```mojo
 from flare.ws import (
     WsClient, WsConnectAttempt, WsServer, WsServerRuntime, WsServerStop,
-    WsDuplex,
+    WsDuplex, WsPublicationAction,
     WsSender, WsReceiver, WsShutdown,
     WsUpgradeRequest, WsUpgradeDecision, WsUpgradeGuard,
     WsFrame, WsOpcode, WsCloseCode,
@@ -28,6 +28,8 @@ from flare.ws import (
   including fragmented totals.
 - `WsSender.send_*_within` — duplex publication within a positive millisecond
   timeout. A `False` result requires immediate shutdown.
+- `WsPublicationAction` — move-only bounded work committed by the I/O owner at
+  final-byte publication before the sender can observe completion.
 - `WsServer` — WebSocket server: `bind` serves plaintext and `bind_tls` accepts
   `TlsServerConfig` for WSS. Both use the same Upgrade, connection, duplex,
   subprotocol, and stoppable-runtime surfaces. Its consuming `serve_stoppable`
@@ -140,7 +142,7 @@ from .client import (
     WsShutdown,
     WsDuplex,
 )
-from ._duplex import WsPreadmissionRelease
+from ._duplex import WsPreadmissionRelease, WsPublicationAction
 from .server import (
     WsHandler,
     WsServer,

@@ -239,21 +239,77 @@ struct _DuplexSync(Movable):
         _require_pthread_success("pthread_cond_broadcast", result)
 
 
+struct WsPublicationAction(Movable):
+    """Opaque bounded work committed at WebSocket byte publication.
+
+    ``invoke`` runs at most once on the receiver-owned I/O thread, while the
+    duplex synchronization lock is held. ``destroy`` owns context cleanup and
+    runs exactly once whether the command publishes or is discarded. Depending
+    on command fate, destruction runs on the sending thread, a stopping thread,
+    or the receiver-owned I/O thread. Both callbacks must be nonblocking,
+    bounded, and non-raising. ``invoke`` may borrow the context only for the
+    duration of its call. Neither callback may call back into the duplex or wait
+    on another thread. A callback may take a different lock only when no thread
+    can hold that lock while calling the duplex.
+    """
+
+    var _context: Int
+    var _invoke: def(Int) thin -> None
+    var _destroy: def(Int) thin -> None
+
+    def __init__(
+        out self,
+        context: Int,
+        invoke: def(Int) thin -> None,
+        destroy: def(Int) thin -> None,
+    ):
+        self._context = context
+        self._invoke = invoke
+        self._destroy = destroy
+
+    def __deinit__(deinit self):
+        self._destroy(self._context)
+
+    def _run(mut self):
+        self._invoke(self._context)
+
+
+def _destroy_publication_action(var action: WsPublicationAction):
+    pass
+
+
+def _invoke_publication_action(var action: WsPublicationAction):
+    action._run()
+
+
 struct _WsWriteCommand(Movable):
     """One encoded frame handed from the sender to the stream owner."""
 
     var id: Int64
     var wire: List[UInt8]
+    var action: Optional[WsPublicationAction]
 
-    def __init__(out self, id: Int64, var wire: List[UInt8]):
+    def __init__(
+        out self,
+        id: Int64,
+        var wire: List[UInt8],
+        var action: Optional[WsPublicationAction],
+    ):
         self.id = id
         self.wire = wire^
+        self.action = action^
 
     def take_wire(mut self) -> List[UInt8]:
         """Move the frame bytes out while leaving a valid command."""
         var wire = self.wire^
         self.wire = List[UInt8]()
         return wire^
+
+    def take_action(mut self) -> Optional[WsPublicationAction]:
+        """Move publication work into the receiver-owned active command."""
+        var action = self.action^
+        self.action = None
+        return action^
 
 
 def _ignore_resolver_hook(_address: Int):
@@ -297,8 +353,10 @@ struct _WsControl(Movable):
     The stream remains owned by the thread driving the current connection
     phase. This control plane publishes only its current fd, never ownership of
     that fd, so cross-thread shutdown can interrupt I/O without racing a close
-    against descriptor reuse. Owner-side final resource release holds ``sync``
-    while clearing and closing the fd through ``begin_owner_close`` /
+    against descriptor reuse. It also owns the one pending duplex command so a
+    shutdown handle retained from before connection establishment can settle
+    unpublished work synchronously. Owner-side final resource release holds
+    ``sync`` while clearing and closing the fd through ``begin_owner_close`` /
     ``finish_owner_close``; potentially blocking protocol shutdown exchanges
     run while the fd remains published and the mutex remains available.
     """
@@ -312,6 +370,9 @@ struct _WsControl(Movable):
     var active_resolver_address: Int
     var active_resolver_cancel: def(Int) thin -> None
     var active_resolver_release: def(Int) thin -> None
+    var pending_command_id: Int64
+    var pending_wire: List[UInt8]
+    var pending_action: Optional[WsPublicationAction]
 
     def __init__(out self) raises:
         self.sync = _DuplexSync()
@@ -323,6 +384,9 @@ struct _WsControl(Movable):
         self.active_resolver_address = 0
         self.active_resolver_cancel = _ignore_resolver_hook
         self.active_resolver_release = _ignore_resolver_hook
+        self.pending_command_id = 0
+        self.pending_wire = List[UInt8]()
+        self.pending_action = None
 
     def is_stopping(mut self) -> Bool:
         return _load_u8(self.stopping) != UInt8(0)
@@ -415,6 +479,7 @@ struct _WsControl(Movable):
 
     def _stop_locked(mut self, message: String):
         """Fix terminal state while the caller holds ``sync``."""
+        self._discard_pending_locked(_load_i64(self.pending_command_id))
         if not self.is_stopping():
             self.failure_message = message
             _store_u8(self.stopping, UInt8(1))
@@ -430,6 +495,30 @@ struct _WsControl(Movable):
             ):
                 _ = _shutdown(self.raw_fd, SHUT_RDWR)
         self.sync.broadcast()
+
+    def _discard_pending_locked(mut self, command_id: Int64):
+        """Discard a matching queued duplex command while ``sync`` is held."""
+        if command_id == 0 or _load_i64(self.pending_command_id) != command_id:
+            return
+        self.pending_wire.clear()
+        _store_i64(self.pending_command_id, 0)
+        if self.pending_action:
+            var action = self.pending_action.take()
+            _destroy_publication_action(action^)
+
+    def _take_pending_locked(mut self) -> Optional[_WsWriteCommand]:
+        """Move the queued duplex command out while ``sync`` is held."""
+        var command_id = _load_i64(self.pending_command_id)
+        if command_id == 0:
+            return Optional[_WsWriteCommand]()
+        var wire = self.pending_wire^
+        self.pending_wire = List[UInt8]()
+        var action = self.pending_action^
+        self.pending_action = None
+        _store_i64(self.pending_command_id, 0)
+        return Optional[_WsWriteCommand](
+            _WsWriteCommand(command_id, wire^, action^)
+        )
 
     def _wake_owner(mut self):
         """Wake the current connection phase after publishing control state."""
@@ -452,8 +541,6 @@ struct _WsDuplexState(Movable):
     var control: ArcPointer[_WsControl]
     var stream: _WsStream
     var next_command_id: Int64
-    var pending_command_id: Int64
-    var pending_wire: List[UInt8]
     var active_command_id: Int64
     var completed_command_id: Int64
     var mask_outbound: Bool
@@ -502,8 +589,6 @@ struct _WsDuplexState(Movable):
         self.control = control
         self.stream = stream^
         self.next_command_id = 0
-        self.pending_command_id = 0
-        self.pending_wire = List[UInt8]()
         self.active_command_id = 0
         self.completed_command_id = 0
         self.mask_outbound = mask_outbound
@@ -553,7 +638,7 @@ struct _WsDuplexState(Movable):
         if (
             _load_i64(self.requested_close_deadline_ns) == 0
             or _load_u8(self.requested_close_taken) != UInt8(0)
-            or _load_i64(self.pending_command_id) != 0
+            or _load_i64(self.control[].pending_command_id) != 0
             or _load_i64(self.active_command_id) != 0
             or self.is_stopping()
         ):
@@ -614,8 +699,6 @@ struct _WsDuplexState(Movable):
         )
         _store_u8(self.requested_close_timed_out, UInt8(1))
         self.requested_close_wire.clear()
-        self.pending_wire.clear()
-        _store_i64(self.pending_command_id, 0)
         self.control[]._stop_locked(message)
         self.control[].sync.unlock()
         self.control[]._wake_owner()
@@ -663,12 +746,15 @@ struct _WsDuplexState(Movable):
 
     def send(mut self, var wire: List[UInt8]) raises:
         """Queue one frame and wait for owner-loop publication."""
-        var published = self._send(wire^, 0)
+        var published = self._send(wire^, 0, None)
         if not published:
             abort("untimed WebSocket send reached a deadline")
 
     def send_until(
-        mut self, var wire: List[UInt8], deadline_ns: Int64
+        mut self,
+        var wire: List[UInt8],
+        deadline_ns: Int64,
+        var action: Optional[WsPublicationAction],
     ) raises -> Bool:
         """Wait through an absolute monotonic publication deadline."""
         if deadline_ns <= 0:
@@ -676,12 +762,13 @@ struct _WsDuplexState(Movable):
                 "WebSocket send deadline must be a positive absolute "
                 "monotonic timestamp"
             )
-        return self._send(wire^, deadline_ns)
+        return self._send(wire^, deadline_ns, action^)
 
     def _send(
         mut self,
         var wire: List[UInt8],
         deadline_ns: Int64,
+        var action: Optional[WsPublicationAction],
     ) raises -> Bool:
         self.control[].sync.lock()
         if self.is_stopping():
@@ -697,17 +784,21 @@ struct _WsDuplexState(Movable):
             self.control[].sync.unlock()
             return False
         if (
-            _load_i64(self.pending_command_id) != 0
+            _load_i64(self.control[].pending_command_id) != 0
             or _load_i64(self.active_command_id) != 0
         ):
             self.control[].sync.unlock()
             raise NetworkError(
                 "WsSender supports exactly one sending thread per connection"
             )
+        if self.next_command_id == Int64.MAX:
+            self.control[].sync.unlock()
+            raise NetworkError("WebSocket command ids exhausted")
         self.next_command_id += 1
         var command_id = self.next_command_id
-        self.pending_wire = wire^
-        _store_i64(self.pending_command_id, command_id)
+        self.control[].pending_wire = wire^
+        self.control[].pending_action = action^
+        _store_i64(self.control[].pending_command_id, command_id)
         self.control[].sync.unlock()
 
         try:
@@ -730,11 +821,13 @@ struct _WsDuplexState(Movable):
                 return True
             if wake == _SEND_WAKE_STOPPED:
                 var message = self.control[].failure_message.copy()
+                self.control[]._discard_pending_locked(command_id)
                 self.control[].sync.unlock()
                 raise NetworkError(
                     message if message != "" else "WebSocket send interrupted"
                 )
             if wake == _SEND_WAKE_DEADLINE:
+                self.control[]._discard_pending_locked(command_id)
                 self.control[].sync.unlock()
                 return False
             if deadline_ns == 0:
@@ -745,25 +838,49 @@ struct _WsDuplexState(Movable):
     def take_pending(mut self) -> Optional[_WsWriteCommand]:
         """Move one queued command into the owner loop."""
         self.control[].sync.lock()
-        var command_id = _load_i64(self.pending_command_id)
-        if command_id == 0:
+        var pending = self.control[]._take_pending_locked()
+        if not pending:
             self.control[].sync.unlock()
             return Optional[_WsWriteCommand]()
-        var wire = self.pending_wire^
-        self.pending_wire = List[UInt8]()
-        var command = _WsWriteCommand(command_id, wire^)
-        _store_i64(self.active_command_id, command_id)
-        _store_i64(self.pending_command_id, 0)
+        var command = pending.take()
+        _store_i64(self.active_command_id, command.id)
         self.control[].sync.unlock()
         return Optional[_WsWriteCommand](command^)
 
-    def complete(mut self, command_id: Int64):
+    def complete(
+        mut self,
+        command_id: Int64,
+        var action: Optional[WsPublicationAction],
+    ):
         """Acknowledge a command after every frame byte reaches the fd."""
+        self.control[].sync.lock()
+        if _load_i64(self.active_command_id) != command_id:
+            self.control[].sync.unlock()
+            abort("WebSocket active command changed before completion")
+        if action:
+            var publication_action = action.take()
+            _invoke_publication_action(publication_action^)
+        _store_i64(self.active_command_id, 0)
+        _store_i64(self.completed_command_id, command_id)
+        self.control[].sync.broadcast()
+        self.control[].sync.unlock()
+
+    def discard_active(
+        mut self,
+        command_id: Int64,
+        var action: Optional[WsPublicationAction],
+    ):
+        """Settle one receiver-owned command that cannot complete."""
         self.control[].sync.lock()
         if _load_i64(self.active_command_id) == command_id:
             _store_i64(self.active_command_id, 0)
-            _store_i64(self.completed_command_id, command_id)
+            if action:
+                var publication_action = action.take()
+                _destroy_publication_action(publication_action^)
             self.control[].sync.broadcast()
+        else:
+            self.control[].sync.unlock()
+            abort("WebSocket active command changed before settlement")
         self.control[].sync.unlock()
 
     def is_stopping(mut self) -> Bool:
@@ -775,12 +892,6 @@ struct _WsDuplexState(Movable):
     def stop(mut self, message: String):
         """Fix terminal state, interrupt the fd, and wake all waiters."""
         self.control[].stop(message)
-        self.control[].sync.lock()
-        if self.is_stopping():
-            self.pending_wire.clear()
-            _store_i64(self.pending_command_id, 0)
-        self.control[].sync.broadcast()
-        self.control[].sync.unlock()
 
     def close_from_owner(mut self):
         """Reclaim TLS and socket state on its sole owning thread."""
@@ -813,6 +924,17 @@ struct WsSender(Movable):
         """Send text within a positive millisecond publication timeout."""
         return self.send_frame_within(WsFrame.text(message), timeout_ms)
 
+    def send_text_within(
+        mut self,
+        message: String,
+        timeout_ms: Int,
+        var action: WsPublicationAction,
+    ) raises -> Bool:
+        """Send text and commit ``action`` at final-byte publication."""
+        return self.send_frame_within(
+            WsFrame.text(message), timeout_ms, action^
+        )
+
     def send_binary(mut self, data: List[UInt8]) raises:
         """Send one masked binary frame."""
         self.send_frame(WsFrame.binary(data))
@@ -822,6 +944,15 @@ struct WsSender(Movable):
     ) raises -> Bool:
         """Send binary data within a positive millisecond timeout."""
         return self.send_frame_within(WsFrame.binary(data), timeout_ms)
+
+    def send_binary_within(
+        mut self,
+        data: List[UInt8],
+        timeout_ms: Int,
+        var action: WsPublicationAction,
+    ) raises -> Bool:
+        """Send binary data and commit ``action`` at publication."""
+        return self.send_frame_within(WsFrame.binary(data), timeout_ms, action^)
 
     def send_frame(mut self, frame: WsFrame) raises:
         """Send one frame through the receiver-owned stream."""
@@ -841,7 +972,28 @@ struct WsSender(Movable):
         """
         var deadline_ns = _send_deadline_ns(timeout_ms)
         var wire = self._shared[].encode_outbound(frame)
-        return self._shared[].send_until(wire^, deadline_ns)
+        return self._shared[].send_until(wire^, deadline_ns, None)
+
+    def send_frame_within(
+        mut self,
+        frame: WsFrame,
+        timeout_ms: Int,
+        var action: WsPublicationAction,
+    ) raises -> Bool:
+        """Send one frame and commit ``action`` at final-byte publication.
+
+        Action invocation is ordered before successful completion can be
+        observed and before the receiver can return a later inbound frame.
+        ``False`` retains the action's publication truth independently of the
+        caller's deadline observation and still requires immediate shutdown.
+        """
+        var deadline_ns = _send_deadline_ns(timeout_ms)
+        var wire = self._shared[].encode_outbound(frame)
+        return self._shared[].send_until(
+            wire^,
+            deadline_ns,
+            Optional[WsPublicationAction](action^),
+        )
 
 
 struct WsShutdown(Movable):
@@ -940,6 +1092,7 @@ struct WsReceiver(Movable):
     var _out_wire: List[UInt8]
     var _out_offset: Int
     var _out_command_id: Int64
+    var _out_action: Optional[WsPublicationAction]
     var _read_retry_want_write: Bool
     var _write_retry_interest: Int
     var _control_wire: List[UInt8]
@@ -956,6 +1109,7 @@ struct WsReceiver(Movable):
         self._out_wire = List[UInt8]()
         self._out_offset = 0
         self._out_command_id = 0
+        self._out_action = None
         self._read_retry_want_write = False
         self._write_retry_interest = 0
         self._control_wire = List[UInt8]()
@@ -965,8 +1119,23 @@ struct WsReceiver(Movable):
         self._fragment_bytes = 0
 
     def __deinit__(deinit self):
+        self._discard_active_command()
         self._shared[].stop("WebSocket receiver closed")
         self._shared[].close_from_owner()
+
+    def _discard_active_command(mut self):
+        """Destroy publication work for an owner command that cannot finish."""
+        if self._out_command_id <= 0:
+            if self._out_action:
+                abort("WebSocket publication action has no active command")
+            return
+        var command_id = self._out_command_id
+        var action = self._out_action^
+        self._out_action = None
+        self._out_wire.clear()
+        self._out_offset = 0
+        self._out_command_id = 0
+        self._shared[].discard_active(command_id, action^)
 
     def _load_outbound(mut self, include_application: Bool):
         if self._out_command_id != 0:
@@ -985,6 +1154,7 @@ struct WsReceiver(Movable):
                 var command = pending.take()
                 self._out_command_id = command.id
                 self._out_wire = command.take_wire()
+                self._out_action = command.take_action()
                 self._out_offset = 0
                 return
         var requested_close = self._shared[].take_requested_close()
@@ -999,6 +1169,7 @@ struct WsReceiver(Movable):
         raise NetworkError(message)
 
     def _terminate(mut self, message: String):
+        self._discard_active_command()
         self._shared[].stop(message)
         self._shared[].close_from_owner()
 
@@ -1006,9 +1177,11 @@ struct WsReceiver(Movable):
         var expired = self._shared[].expire_requested_close()
         if expired:
             var message = expired.take()
+            self._discard_active_command()
             self._shared[].close_from_owner()
             raise NetworkError(message^)
         if self._shared[].is_stopping():
+            self._discard_active_command()
             self._shared[].close_from_owner()
             raise NetworkError("WebSocket duplex stopped")
 
@@ -1062,7 +1235,9 @@ struct WsReceiver(Movable):
                 self._out_offset = 0
                 self._out_command_id = 0
                 if completed_id > 0:
-                    self._shared[].complete(completed_id)
+                    var action = self._out_action^
+                    self._out_action = None
+                    self._shared[].complete(completed_id, action^)
                 elif completed_id == _OUTBOUND_REQUESTED_CLOSE_ID:
                     self._shared[].note_requested_close_published()
             return written
